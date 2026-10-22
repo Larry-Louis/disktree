@@ -1,7 +1,7 @@
 //! Identity captured on the scanned machine, never inferred from an alias.
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostIdentity {
     pub hostname: String,
     pub machine_id: Option<String>,

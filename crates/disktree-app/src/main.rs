@@ -66,19 +66,21 @@ Remote sessions are read-only: mark, export list/prompt/delete script.
 Use --check with ssh to deploy and scan without opening a window.
 
 arguments:
-  PATH              directory to scan (default: the home directory)
+  PATH              explicit directory to scan; omitted opens root selection
 
-The window opens on a treemap of the root, largest first. Space marks the
+Without PATH, choose this computer or SSH, then a mount or directory.
+No scan starts before explicit acceptance. Nested mounts are excluded.
+With PATH the window scans it directly, largest first. Space marks the
 selected tile, Enter opens it, c reviews the marked list, ? lists every key.
 
 options:
   -a, --apparent-size   measure apparent length instead of allocated blocks
-  -l, --follow-links    follow symlinks
+  -l, --follow-links    follow symlinks (local scans only)
   -H, --no-hidden       skip dotfiles and dot-directories
   -D, --disk            scan the whole disk the home directory is on
   -X, --cross-filesystems
                         also measure other disks, network shares and pseudo
-                        filesystems mounted below PATH (off by default)
+                        filesystems mounted below PATH (local only; off by default)
   -d, --depth N         how many levels to draw at once (1-6, default 3)
       --power-efficiency PRESET
                         miser, balanced (default), aggressive, drain-my-battery

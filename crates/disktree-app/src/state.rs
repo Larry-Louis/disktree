@@ -821,7 +821,7 @@ impl Disktree {
         false
     }
 
-    fn finish_volume_listing(
+    pub(crate) fn finish_volume_listing(
         &mut self,
         result: std::io::Result<(
             Vec<disktree_core::space::Volume>,
@@ -867,6 +867,7 @@ impl Disktree {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.connect_picker(cx);
                 }
+                cx.notify();
             })
             .detach();
             self.picker_host = Some(host);
@@ -883,6 +884,24 @@ impl Disktree {
             .detach();
             self.picker_path = Some(path);
         }
+    }
+
+    pub fn picker_source_matches(&self, cx: &Context<'_, Self>) -> bool {
+        self.picker_host.as_ref().is_none_or(|input| {
+            input.read(cx).value().trim()
+                == self.volumes_source.as_deref().unwrap_or_default()
+        })
+    }
+
+    pub fn choose_local_source(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(host) = self.picker_host.clone() {
+            host.update(cx, |host, cx| host.set_value("", window, cx));
+        }
+        self.load_volume_source(None, cx);
     }
 
     pub fn connect_picker(&mut self, cx: &mut Context<'_, Self>) {
@@ -913,6 +932,13 @@ impl Disktree {
             || self.volumes_loading
             || self.volumes_error.is_some()
         {
+            return;
+        }
+        if !self.picker_source_matches(cx) {
+            self.picker_error = Some(
+                "Connect SSH or choose This computer before scanning.".into(),
+            );
+            cx.notify();
             return;
         }
         if !path.is_absolute() {
@@ -954,6 +980,10 @@ impl Disktree {
             };
         }
         self.remote.clone_from(&self.volumes_source);
+        if self.remote.is_some() {
+            self.options.follow_links = false;
+            self.options.one_filesystem = true;
+        }
         self.awaiting_root = false;
         self.close_volumes(cx);
         self.set_root(path, cx);
@@ -1266,6 +1296,22 @@ impl Disktree {
         .detach();
     }
 
+    pub(crate) fn update_remote_identity(
+        &mut self,
+        identity: Option<disktree_core::identity::HostIdentity>,
+    ) {
+        // A stable SSH alias can be repointed to a different machine.
+        // Old marks must not acquire that machine's freshly captured guard.
+        if self.remote_identity != identity && !self.marks.is_empty() {
+            self.marks.clear();
+            self.notice = Some((
+                "Remote identity changed; previous marks were cleared.".into(),
+                Status::Warning,
+            ));
+        }
+        self.remote_identity = identity;
+    }
+
     /// Drain the scan channel once. Returns whether the poller should keep
     /// ticking. Driven by the poll task above, and by the tests, which cannot
     /// wait on the test clock while a real worker thread walks a directory.
@@ -1289,7 +1335,7 @@ impl Disktree {
                     self.disk_root = snapshot.header.disk_root;
                     self.space = snapshot.header.space;
                     self.remote_platform = snapshot.header.platform;
-                    self.remote_identity = snapshot.header.identity;
+                    self.update_remote_identity(snapshot.header.identity);
                     self.device = self.remote.as_ref().map(|host| {
                         format!("{host} · read-only · space at scan")
                     });
@@ -3636,16 +3682,20 @@ impl Render for Disktree {
         self.tick_transition(window);
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
-        let title = format!(
-            "disktree{} · {}",
-            self.remote.as_ref().map_or_else(String::new, |host| {
-                format!(" · {host} · read-only")
-            }),
-            crate::marks::display_path(
-                &self.current_path(),
-                self.home.as_deref()
+        let title = if self.awaiting_root {
+            "disktree · Choose a source".into()
+        } else {
+            format!(
+                "disktree{} · {}",
+                self.remote.as_ref().map_or_else(String::new, |host| {
+                    format!(" · {host} · read-only")
+                }),
+                crate::marks::display_path(
+                    &self.current_path(),
+                    self.home.as_deref()
+                )
             )
-        );
+        };
         if title != self.window_title {
             window.set_window_title(&title);
             self.window_title = title;

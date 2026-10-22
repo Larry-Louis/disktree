@@ -129,8 +129,7 @@ pub fn root(
     root
 }
 
-/// Picking another volume scans it from scratch: the picker lists every
-/// volume with its free space, and the choice is the new root.
+/// Discovery is lightweight; a separate, explicit action starts the walk.
 fn volumes_dialog(
     app: &Disktree,
     window: &Window,
@@ -138,6 +137,7 @@ fn volumes_dialog(
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let cancel = cx.entity().downgrade();
+    let source_ready = app.picker_source_matches(cx);
     let source = app.volumes_source.as_ref().map_or_else(
         || "This computer".to_owned(),
         |host| format!("{host} · SSH · read-only"),
@@ -200,14 +200,14 @@ fn volumes_dialog(
         .picker_path
         .as_ref()
         .expect("picker prepared before rendering");
-    let popup = dialog_popup(cx).w(size::SOURCE_PICKER)
+    let popup = dialog_popup(cx).w_full()
         .child(dialog_title("Choose what to scan", cx))
         .child(dialog_description(
-            "Connect, then select a mount or directory. Nothing is scanned until you choose Scan.",
+            "Connect, then select a mount or directory. No new scan starts until you choose Scan.",
             cx))
         .child(div().flex().flex_row().gap(space::SM)
             .child(button("source-local", "This computer", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, _, cx| this.load_volume_source(None, cx))))
+                .on_click(cx.listener(|this, _, window, cx| this.choose_local_source(window, cx))))
             .child(gpui_omarchy::input("source-host", host, window, cx)
                 .debug_selector(|| "source-host".into()).flex_1())
             .child(button("source-connect", "Connect SSH", ButtonVariant::Secondary, cx)
@@ -220,7 +220,7 @@ fn volumes_dialog(
             .child(gpui_omarchy::input("source-path", path, window, cx)
                 .debug_selector(|| "source-path".into()).flex_1())
             .child(button("source-scan-path", "Scan directory", ButtonVariant::Secondary, cx)
-                .disabled(app.volumes_loading || app.volumes_error.is_some())
+                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some())
                 .on_click(cx.listener(|this, _, _, cx| this.choose_picker_path(cx)))))
         .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(error.clone())))
         .child(div().flex().flex_row().justify_end().gap(space::SM)
@@ -228,11 +228,25 @@ fn volumes_dialog(
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.close_volumes(cx); this.apply_focus(window, cx);
                 })))
-            .child(dialog_button("source-scan", "Scan selected mount", ButtonVariant::Primary, cx)
-                .disabled(app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
+            .child(dialog_button("source-scan", "Scan selected root", ButtonVariant::Primary, cx)
+                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.choose_volume(cx); this.apply_focus(window, cx);
                 }))));
+    let popup = div()
+        .id("source-picker-scroll")
+        .debug_selector(|| "source-picker".into())
+        .w(size::SOURCE_PICKER)
+        .max_w(Rems(
+            window.viewport_size().width.as_f32() / app.rem
+                * size::SOURCE_VIEWPORT_FRACTION,
+        ))
+        .max_h(Rems(
+            window.viewport_size().height.as_f32() / app.rem
+                * size::SOURCE_VIEWPORT_FRACTION,
+        ))
+        .overflow_y_scroll()
+        .child(popup);
     let centred = centred_popup(popup, {
         let close = cancel.clone();
         move |_, window, cx| {

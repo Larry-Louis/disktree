@@ -53,7 +53,7 @@ help:
 	@echo "disktree"
 	@echo
 	@echo "  make build       release build"
-	@echo "  make run         build and run, scanning $$HOME"
+	@echo "  make run         build and open the source/root chooser"
 	@echo "  make install-scan  build/install the headless SSH helper only"
 	@echo "  make install     install to $(PREFIX): binary, desktop entry, icon"
 	@echo "                   (macOS: disktree.app into $(APPS))"

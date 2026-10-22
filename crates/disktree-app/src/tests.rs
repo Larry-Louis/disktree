@@ -207,6 +207,181 @@ fn switching_from_remote_to_local_clears_machine_specific_marks(
 }
 
 #[gpui_kit::test]
+fn chooser_fits_a_small_window_at_large_interface_zoom(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (_, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    for rem in [16., 28.] {
+        cx.update(|window, _| window.set_rem_size(px(rem)));
+        draw(cx);
+        let bounds = cx
+            .debug_bounds("source-picker")
+            .expect("scrollable chooser");
+        assert!(bounds.size.width > px(200.), "{bounds:?}");
+        assert!(
+            bounds.origin.x >= px(0.) && bounds.right() <= px(900.),
+            "{bounds:?}"
+        );
+        assert!(
+            bounds.origin.y >= px(0.) && bounds.bottom() <= px(600.),
+            "{bounds:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, Disktree::open_volumes);
+    cx.run_until_parked();
+    draw(cx);
+    let before = read(&view, cx, |app| app.scan_epoch);
+    let input = cx.debug_bounds("source-host").unwrap();
+    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
+    cx.simulate_input("new-host-not-connected");
+    update(&view, cx, |app, cx| {
+        app.choose_source_root(temp.path().into(), cx);
+        assert!(app.picker_error.is_some());
+        assert!(app.remote.is_none());
+        assert_eq!(app.scan_epoch, before);
+        assert!(app.tree.is_some());
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+}
+
+#[gpui_kit::test]
+fn a_directory_error_can_be_corrected_without_reconnecting(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    update(&view, cx, |app, cx| {
+        app.choose_source_root(PathBuf::from("relative"), cx);
+        assert!(app.picker_error.is_some());
+        assert!(app.awaiting_root);
+        app.choose_source_root(temp.path().into(), cx);
+        assert!(app.picker_error.is_none());
+        assert!(!app.awaiting_root);
+    });
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
+fn stale_local_discovery_cannot_overwrite_a_new_source_error(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    // The old discovery is still queued. The new host fails validation
+    // without any network connection; only its error may remain.
+    update(&view, cx, |app, cx| {
+        app.load_volume_source(Some("-invalid".into()), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.volumes_source.as_deref(), Some("-invalid"));
+        assert!(app.volumes_error.is_some());
+        assert!(app.volumes.is_empty());
+        assert!(app.remote.is_none());
+    });
+    update(&view, cx, |app, cx| {
+        app.close_volumes(cx);
+        assert!(!app.poll_roots_once(1, cx));
+    });
+}
+
+#[gpui_kit::test]
+fn remote_root_acceptance_never_stats_the_path_locally(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.volumes_open = true;
+        // An intentionally invalid SSH destination ensures acceptance cannot
+        // contact any machine. The listing is a decoded fixture, not a walk.
+        app.volumes_source = Some("-test-fixture".into());
+        app.finish_volume_listing(
+            Ok((
+                vec![Volume {
+                    point: PathBuf::from("/only-on-the-remote-host"),
+                    device: Some("/dev/remote-disk".into()),
+                    space: None,
+                }],
+                None,
+            )),
+            cx,
+        );
+    });
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.choose_volume(cx);
+        assert_eq!(app.remote.as_deref(), Some("-test-fixture"));
+        assert_eq!(app.root_path, PathBuf::from("/only-on-the-remote-host"));
+        assert!(app.marks.is_empty() && app.remote_identity.is_none());
+        assert!(
+            app.tree.is_none()
+                && app.scan.is_none()
+                && app.remote_scan.is_none()
+        );
+        assert!(
+            app.scan_error
+                .as_ref()
+                .is_some_and(|error| error.contains("invalid SSH"))
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let old = disktree_core::identity::HostIdentity {
+            hostname: "same-name".into(),
+            machine_id: Some("machine-a".into()),
+        };
+        app.remote = Some("stable-alias".into());
+        app.update_remote_identity(Some(old.clone()));
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.update_remote_identity(Some(old.clone()));
+        assert!(!app.marks.is_empty(), "same machine keeps its marks");
+        app.update_remote_identity(Some(
+            disktree_core::identity::HostIdentity {
+                hostname: old.hostname,
+                machine_id: Some("machine-b".into()),
+            },
+        ));
+        assert!(app.marks.is_empty(), "same alias is not proof of identity");
+        app.toggle_mark_selected(cx);
+        assert!(!app.marks.is_empty());
+        app.update_remote_identity(None);
+        assert!(app.marks.is_empty(), "lost identity also fails closed");
+    });
+}
+
+#[gpui_kit::test]
 fn remote_review_never_deletes_even_through_direct_actions(
     cx: &mut TestAppContext,
 ) {

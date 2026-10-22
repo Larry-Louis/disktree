@@ -5,8 +5,9 @@
 Find what is filling a disk, mark what should go, and remove it — with the
 volume's free space in view the whole time.
 
-disktree is a treemap for Omarchy. It scans your home directory by default,
-draws every directory as a nested mosaic sized by what it really costs on disk,
+disktree is a treemap for Omarchy. Choose a local or SSH source, then a
+mounted volume or directory; no scan starts until you explicitly accept.
+It draws every directory as a nested mosaic sized by its real disk cost,
 and lets you walk into it with the keyboard or the mouse. Mark as much as you
 like; nothing happens until you review the list and commit, and the permanent
 path always asks first.
@@ -138,7 +139,8 @@ See [On Windows](#on-windows) for what differs there.
 ## Use
 
 ```sh
-disktree            # scan the home directory
+disktree            # choose a local/SSH source and root
+disktree ~          # explicitly scan home
 disktree --disk     # the whole disk it lives on
 disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
@@ -147,7 +149,7 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 ### Servers over SSH (read-only)
 
 ```sh
-disktree ssh dev                 # remote home; dev is an SSH config alias
+disktree ssh dev                 # connect and choose a remote root
 disktree ssh user@server /var    # an explicit remote path
 disktree ssh dev --disk          # the disk containing the remote home
 disktree ssh dev -a /srv         # apparent size instead of allocated blocks
@@ -243,7 +245,7 @@ There are no trash/delete buttons or removal-mode choices in remote review.
 Deletion shortcuts and removal entry points are disabled too. Git inspection,
 local folder selection and file-manager reveal are disabled so remote names
 cannot accidentally act on this computer. Free space is sampled when the
-scan completes, **not live**; press `r` to refresh.
+scan starts, **not live**; press `r` to refresh.
 
 Before deleting, scripts compare the server's actual kernel hostname and
 machine ID against the identity captured in the scan—not the SSH alias.
@@ -349,7 +351,7 @@ and shows how much free space was actually gained.
 | `i` | include or skip hidden entries |
 | `r` | scan again |
 | `esc` while scanning | stop the scan |
-| `v` | scan another mounted volume |
+| `v` | choose a local/SSH source and root |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
@@ -393,14 +395,31 @@ scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
 and removes duplicate hardlinks.
 
-## Switching volumes
+## Choosing sources and roots
 
-Press `v` (or click **Volumes** beside the disk name in the side panel) to
-bring up the volume picker. It lists every candidate volume mounted on the
-system together with its free space, ordered fullest first, filtering out
-pseudo-filesystems and snapshots. Linux bind mounts and btrfs subvolumes
-remain separately selectable, even when they share a device. Selecting any
-entry resets the scan root directly to that volume.
+Launch without a path to choose **This computer** or enter an SSH alias /
+`user@host` and press **Connect SSH**. Discovery reads that machine's mount
+namespace, not file contents. It never starts a scan or probes mounted
+network filesystems just to fill the list.
+
+Select a mount and choose **Scan selected root**, or enter an absolute
+directory path and choose **Scan directory**. Enter acts on the focused
+host/path field or the highlighted mount. Escape cancels discovery and
+returns to the current scan, or the idle welcome screen at startup.
+
+During exploration, press `v`, click **Source…** beside the disk name,
+or click the disktree logo to reopen the same chooser. The source being
+browsed is shown explicitly, and connecting never retargets an existing
+scan. Changing machines on acceptance clears the old machine's marks,
+identity and navigation history; an absolute path is not an identity
+across hosts. A rescan that detects a changed or lost remote machine
+identity also clears marks, even if the SSH alias is unchanged.
+
+Pseudo-filesystems, snapshots and automount triggers are filtered out.
+Linux bind mounts and btrfs subvolumes remain individually selectable,
+even when they share a device. Free space is measured only after choosing
+a root. Explicit command-line paths and `--disk` still start directly;
+`ssh HOST --check [PATH]` remains the headless scan command.
 
 ## The whole disk
 
@@ -512,7 +531,7 @@ windowrule = size 1400 900, class:^(disktree)$
 ## Develop
 
 ```sh
-make run      # release build, scanning $HOME
+make run      # release build, opening the source/root chooser
 make lint     # rustfmt --check, then clippy with every warning an error
 make test     # scanner, layout and removal tests, plus window-harness tests
 make test-ssh # real localhost SSH scans/errors; Linux, bun + openssh required

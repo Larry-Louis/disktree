@@ -99,6 +99,8 @@ pub mod size {
     /// Source/root chooser, with room for host, path and mount labels.
     pub const SOURCE_PICKER: Rems = Rems(40.0);
     pub const SOURCE_LIST_HEIGHT: Rems = Rems(18.0);
+    /// Leave a visible backdrop even at large interface zoom.
+    pub const SOURCE_VIEWPORT_FRACTION: f32 = 0.92;
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
     /// The key column of the keyboard overlay.
