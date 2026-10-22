@@ -2450,6 +2450,14 @@ fn scanning_panel(
                     .text_size(text::BODY)
                     .child(error.clone()),
             )
+            .children(app.remote_progress.directory.as_ref().map(|path| {
+                div()
+                    .max_w(size::HELP)
+                    .truncate()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(format!("Last directory: {}", path.display()))
+            }))
             .child(widgets::hint("r", "retry scan", cx));
     }
     let progress = &app.progress;
@@ -2479,8 +2487,11 @@ fn scanning_panel(
                 .text_color(theme.bright)
                 .child(if cancelled {
                     format!("Stopped reading {}", widgets::display_root(app))
+                } else if app.remote.is_some() {
+                    format!("{} · {}", app.remote_progress.stage.label(),
+                        widgets::display_root(app))
                 } else {
-                    format!("Reading {}", widgets::display_root(app))
+                    format!("Indexing {}", widgets::display_root(app))
                 }),
         )
         .child(
@@ -2509,16 +2520,18 @@ fn scanning_panel(
         .when(!cancelled, |panel| {
             panel.child(
                 div()
-                    .w(size::SCANNING_METER)
-                    .child(widgets::meter_row(
-                        "",
-                        "",
-                        progress_estimate(progress.files),
-                        theme.accent,
-                        cx,
-                    )),
+                    .debug_selector(|| "scan-activity".into())
+                    .text_size(text::BODY)
+                    .text_color(theme.accent)
+                    .child(scan_activity(app)),
             )
         })
+        .children(app.remote_progress.directory.as_ref().map(|path| {
+            div().debug_selector(|| "scan-directory".into())
+                .max_w(size::HELP).min_w_0().truncate()
+                .text_size(text::CAPTION).text_color(theme.secondary)
+                .child(format!("Recent directory: {}", path.display()))
+        }))
         .child(
             div()
                 .text_size(text::BODY)
@@ -2526,7 +2539,7 @@ fn scanning_panel(
                 .child(if cancelled {
                     "Nothing is shown from a scan that did not finish."
                 } else {
-                    "Marking, zooming and the free-space meter all work as soon as it lands."
+                    "Total unknown until indexing finishes. Results stream live."
                 }),
         )
         // A failed scan has nothing left to cancel either.
@@ -2543,6 +2556,24 @@ fn scanning_panel(
                     window.focus(&this.focus, cx);
                 }))
         })
+}
+
+fn scan_activity(app: &Disktree) -> String {
+    let elapsed = app
+        .scan_started
+        .map_or(0.0, |start| start.elapsed().as_secs_f64());
+    let phase = (elapsed * 8.0) as usize % 4;
+    let spinner = ["◐", "◓", "◑", "◒"][phase];
+    let rate = app.progress.files as f64 / elapsed.max(1.0);
+    let quiet = app
+        .remote_progress
+        .updated
+        .map_or(0, |at| at.elapsed().as_secs());
+    if app.remote.is_some() && quiet >= 5 {
+        format!("{spinner} {elapsed:.0}s elapsed · no new entries for {quiet}s")
+    } else {
+        format!("{spinner} {elapsed:.0}s elapsed · {rate:.0} files/s avg")
+    }
 }
 
 fn find_field(app: &Disktree, theme: &Theme) -> Div {
@@ -2646,18 +2677,6 @@ fn marks_ancestor(
         .filter(|item| item.path != path && path.starts_with(&item.path))
         .map(|item| short_name(&item.path))
         .next()
-}
-
-/// A scan has no total to measure against, so the meter shows the work done
-/// rather than pretending to know how far along it is.
-fn progress_estimate(files: u64) -> f32 {
-    if files == 0 {
-        0.06
-    } else {
-        // Asymptotic: the bar keeps moving while the walk continues.
-        let scaled = files as f32 / (files as f32 + 20_000.0);
-        (0.1 + scaled * 0.85).min(0.99)
-    }
 }
 
 // ── review ──────────────────────────────────────────────────────────────
@@ -3375,7 +3394,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         body = body.child(widgets::meter_row(
             "re-scanning",
             format!("{} files", widgets::human_count(app.progress.files)),
-            progress_estimate(app.progress.files),
+            0.0,
             theme.accent,
             cx,
         ));

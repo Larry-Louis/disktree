@@ -11,11 +11,13 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use serde::{Deserialize, Serialize};
 
+use crate::remote_progress::{INTERVAL, Progress, Shared, Stage, stage};
 use crate::scan::ScanOptions;
 #[cfg(not(unix))]
 use crate::scan::scan;
 use crate::space::{SpaceInfo, space_info, volume_root_for};
 use crate::tree::{Node, NodeKind, aggregate};
+use std::time::Instant;
 
 const VERSION: u32 = 1;
 const MAX_LINE: u64 = 1 << 20;
@@ -57,6 +59,9 @@ pub struct SessionRequest {
     pub operation: Operation,
     #[serde(default)]
     pub watch_disconnect: bool,
+    // Opt-in keeps the postorder-only wire format for older clients.
+    #[serde(default)]
+    pub live_progress: bool,
 }
 
 /// The target's root candidates, without walking or probing any of them.
@@ -166,7 +171,9 @@ pub fn serve_session(
     out: &mut impl Write,
 ) -> io::Result<()> {
     match session.operation {
-        Operation::Scan(request) => serve_request(request, out),
+        Operation::Scan(request) => {
+            serve_request_with_progress(request, out, session.live_progress)
+        }
         Operation::Discover { discover_version } => {
             if discover_version != VERSION {
                 return Err(io::Error::other(
@@ -190,6 +197,15 @@ pub fn serve_session(
 
 /// Scan a decoded request. The standalone helper supervises its lifetime.
 pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
+    serve_request_with_progress(request, out, false)
+}
+
+fn serve_request_with_progress(
+    request: Request,
+    out: &mut impl Write,
+    live_progress: bool,
+) -> io::Result<()> {
+    let _ = live_progress; // Only Unix has the streaming walker.
     let home = std::env::home_dir();
     let root = request
         .root
@@ -218,7 +234,7 @@ pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
     )?;
     out.flush()?;
     #[cfg(unix)]
-    crate::remote_walk::stream(&root, &request.options, out)?;
+    crate::remote_walk::stream(&root, &request.options, out, live_progress)?;
     #[cfg(not(unix))]
     write_node(out, &scan(&root, request.options)?)?;
     // An explicit terminator distinguishes a complete scan from a severed SSH
@@ -257,15 +273,40 @@ fn write_node(out: &mut impl Write, node: &Node) -> io::Result<()> {
 }
 
 pub fn read_snapshot(input: &mut impl BufRead) -> io::Result<Snapshot> {
+    read_snapshot_with_progress(input, &Shared::default())
+}
+
+fn read_snapshot_with_progress(
+    input: &mut impl BufRead,
+    shared: &Shared,
+) -> io::Result<Snapshot> {
     let header: Header = receive(input)?;
     if header.version != VERSION || !header.root.is_absolute() {
         return Err(io::Error::other("incompatible remote helper protocol"));
     }
+    let mut progress = Progress {
+        stage: Stage::Indexing,
+        directory: Some(header.root.clone()),
+        updated: Some(Instant::now()),
+        ..Progress::default()
+    };
+    *shared.lock().expect("remote progress lock") = progress.clone();
+    let mut published = Instant::now();
     let mut stack = Vec::<Node>::new();
     loop {
         let value: serde_json::Value = receive(input)?;
         if value == "done" {
             break;
+        }
+        if let Some(directory) = value.get("directory") {
+            progress.directory = Some(
+                serde_json::from_value(directory.clone())
+                    .map_err(json_error)?,
+            );
+            progress.updated = Some(Instant::now());
+            *shared.lock().expect("remote progress lock") = progress.clone();
+            published = Instant::now();
+            continue;
         }
         let Record(name, kind, bytes, files, modified, read_error, count) =
             serde_json::from_value(value).map_err(json_error)?;
@@ -297,14 +338,36 @@ pub fn read_snapshot(input: &mut impl BufRead) -> io::Result<Snapshot> {
         if !kind.is_dir() && count != 0 {
             return Err(io::Error::other("remote leaf has children"));
         }
-        let children = stack.split_off(stack.len() - count);
+        // The final root often owns every stacked node. Transfer that
+        // allocation instead of briefly duplicating a wide tree's storage.
+        let children = if count == stack.len() {
+            std::mem::take(&mut stack)
+        } else {
+            stack.split_off(stack.len() - count)
+        };
         let mut node = Node::entry(name, kind, bytes);
         node.files = files;
         node.modified = modified;
         node.read_error = read_error;
         node.children = children;
         stack.push(node);
+        progress.dirs += u64::from(kind.is_dir());
+        // Legacy helpers include direct totals in directory records too.
+        // Count each leaf once, never charge its parent's totals again.
+        if !kind.is_dir() {
+            progress.files += files;
+            progress.bytes += bytes;
+        }
+        progress.errors += u64::from(read_error);
+        if published.elapsed() >= INTERVAL {
+            progress.updated = Some(Instant::now());
+            *shared.lock().expect("remote progress lock") = progress.clone();
+            published = Instant::now();
+        }
     }
+    progress.stage = Stage::Finalizing;
+    progress.updated = Some(Instant::now());
+    *shared.lock().expect("remote progress lock") = progress;
     if stack.len() != 1 {
         return Err(io::Error::other("incomplete remote tree"));
     }
@@ -369,8 +432,7 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
              Run make install-scan from the checkout on the server."
         )
     } else {
-        "Check the server's SSH connection and disktree-scan installation."
-            .into()
+        "No incomplete scan is shown. Retry, or choose another root.".into()
     };
     io::Error::other(format!("SSH {host}: {reason}\n\n{hint}"))
 }
@@ -383,6 +445,7 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
 pub struct RemoteJob<T> {
     child: Arc<Mutex<Child>>,
     result: mpsc::Receiver<io::Result<T>>,
+    progress: Shared,
 }
 
 pub type RemoteScan = RemoteJob<Snapshot>;
@@ -442,8 +505,9 @@ impl RemoteScan {
             host,
             Operation::Scan(request.clone()),
             archive,
-            move |input| {
-                let mut snapshot = read_snapshot(input)?;
+            move |input, progress| {
+                let mut snapshot =
+                    read_snapshot_with_progress(input, progress)?;
                 if metric != crate::tree::Metric::Bytes {
                     aggregate(&mut snapshot.tree, metric);
                 }
@@ -463,7 +527,7 @@ impl RemoteRoots {
                 discover_version: VERSION,
             },
             archive,
-            read_roots,
+            |input, _| read_roots(input),
         )
     }
 }
@@ -476,6 +540,7 @@ impl<T: Send + 'static> RemoteJob<T> {
         archive: Option<crate::payload::Archive>,
         decode: impl FnOnce(
             &mut BufReader<std::process::ChildStdout>,
+            &Shared,
         ) -> io::Result<T>
         + Send
         + 'static,
@@ -494,22 +559,29 @@ impl<T: Send + 'static> RemoteJob<T> {
         let worker = child.clone();
         let host = host.to_owned();
         let (tx, result) = mpsc::channel();
+        let progress = Shared::default();
+        let live = progress.clone();
         std::thread::spawn(move || {
             let mut input = BufReader::new(stdout);
             let response = (|| {
                 if let Some(archive) = archive {
-                    crate::deployment::deploy(
-                        &archive, &mut input, &mut stdin,
+                    crate::deployment::deploy_with_progress(
+                        &archive,
+                        &mut input,
+                        &mut stdin,
+                        |value| stage(&live, value),
                     )?;
                 }
+                stage(&live, Stage::Starting);
                 send(
                     &mut stdin,
                     &SessionRequest {
                         operation,
                         watch_disconnect: true,
+                        live_progress: true,
                     },
                 )?;
-                decode(&mut input)
+                decode(&mut input, &live)
             })();
             drop(stdin);
             if response.is_err() {
@@ -541,7 +613,15 @@ impl<T: Send + 'static> RemoteJob<T> {
             };
             let _ = tx.send(outcome);
         });
-        Ok(Self { child, result })
+        Ok(Self {
+            child,
+            result,
+            progress,
+        })
+    }
+
+    pub fn progress(&self) -> Progress {
+        self.progress.lock().expect("remote progress lock").clone()
     }
 
     pub fn poll(&self) -> Option<io::Result<T>> {
@@ -640,6 +720,7 @@ mod tests {
                 discover_version: VERSION,
             },
             watch_disconnect: true,
+            live_progress: true,
         };
         let bytes = serde_json::to_vec(&session).unwrap();
         assert!(serde_json::from_slice::<Request>(&bytes).is_err());
@@ -778,6 +859,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::fs::write(data.path().join("keep"), b"hello").unwrap();
+        // Exercise the shipped static helper beyond the removed 256-level
+        // cutoff, through deployment and decoding, not just the walker.
+        let mut deep = data.path().to_path_buf();
+        for _ in 0..320 {
+            deep.push("d");
+            std::fs::create_dir(&deep).unwrap();
+        }
+        std::fs::write(deep.join("leaf"), b"world").unwrap();
         let cache = home.path().join("cache");
         let remote = format!(
             "HOME={} XDG_CACHE_HOME={}; export HOME XDG_CACHE_HOME;\n{}",
@@ -810,7 +899,9 @@ mod tests {
             )
             .unwrap();
             let snapshot = wait(&handle).unwrap();
-            assert_eq!(snapshot.tree.bytes, 5);
+            assert_eq!(snapshot.tree.bytes, 10);
+            assert_eq!(snapshot.tree.files, 2);
+            assert_eq!(handle.progress().files, 2);
             assert!(snapshot.header.identity.is_some());
             assert_eq!(std::fs::read(&cached).unwrap(), bytes);
             if attempt == 1 {
@@ -851,7 +942,7 @@ mod tests {
                 discover_version: VERSION,
             },
             Some(archive),
-            read_roots,
+            |input, _| read_roots(input),
         )
         .unwrap();
         let roots = wait(&job).unwrap();
@@ -930,6 +1021,57 @@ mod tests {
         assert!(snapshot.tree.child_named(r"back\slash").is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_counters_are_available_before_the_tree_finishes() {
+        use std::os::unix::net::UnixStream;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"hello").unwrap();
+        let request = Request {
+            root: Some(dir.path().into()),
+            disk: false,
+            options: ScanOptions {
+                apparent_size: true,
+                ..ScanOptions::default()
+            },
+        };
+        let mut data = Vec::new();
+        serve_request(request, &mut data).unwrap();
+        let mut lines = data.split_inclusive(|byte| *byte == b'\n');
+        let header = lines.next().unwrap();
+        let leaf = lines.next().unwrap();
+        let tail = lines.flatten().copied().collect::<Vec<_>>();
+        let (mut output, input) = UnixStream::pair().unwrap();
+        input
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let shared = Shared::default();
+        let live = shared.clone();
+        let worker = std::thread::spawn(move || {
+            read_snapshot_with_progress(&mut BufReader::new(input), &live)
+        });
+        output.write_all(header).unwrap();
+        output.write_all(leaf).unwrap();
+        send(&mut output, &serde_json::json!({"directory": dir.path()}))
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let progress = shared.lock().unwrap().clone();
+            if progress.files == 1 {
+                assert_eq!(progress.bytes, 5);
+                assert_eq!(progress.stage, Stage::Indexing);
+                assert!(!worker.is_finished());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        output.write_all(&tail).unwrap();
+        let snapshot = worker.join().unwrap().unwrap();
+        assert_eq!(snapshot.tree.bytes, 5);
+        assert_eq!(shared.lock().unwrap().stage, Stage::Finalizing);
+    }
+
     #[test]
     fn protocol_roundtrip_and_truncation() {
         let dir = tempfile::tempdir().unwrap();
@@ -947,6 +1089,7 @@ mod tests {
         let mut input = Vec::new();
         send(&mut input, &request).unwrap();
         serve(&mut input.as_slice(), &mut data).unwrap();
+        assert!(!data.windows(11).any(|part| part == b"\"directory\""));
         let snapshot = read_snapshot(&mut data.as_slice()).unwrap();
         assert_eq!(snapshot.tree.bytes, 5);
         assert_eq!(snapshot.tree.files, 1);

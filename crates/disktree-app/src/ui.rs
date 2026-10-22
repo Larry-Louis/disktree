@@ -85,7 +85,6 @@ pub mod size {
     /// A thin meter: share of the scan, the disk.
     pub const METER: Rems = Rems(0.3125);
     /// The meter on the scanning panel.
-    pub const SCANNING_METER: Rems = Rems(26.25);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.

@@ -93,6 +93,34 @@ fn read<R>(
 }
 
 #[gpui_kit::test]
+fn remote_indexing_draws_live_activity_and_the_sampled_directory(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.tree = None;
+        app.remote = Some("fixture-only".into());
+        app.scan_started = Some(std::time::Instant::now());
+        app.progress.files = 1234;
+        app.progress.bytes = 123_456;
+        app.remote_progress.stage =
+            disktree_core::remote_progress::Stage::Indexing;
+        app.remote_progress.directory = Some(temp.path().join("junk/deeper"));
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("scan-activity").is_some());
+    assert!(cx.debug_bounds("scan-directory").is_some());
+    update(&view, cx, |app, _| {
+        app.scan_error = Some("fixture scan failed".into());
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("scan-error").is_some());
+    assert!(cx.debug_bounds("scan-reading").is_none());
+}
+
+#[gpui_kit::test]
 fn startup_chooser_never_scans_before_explicit_acceptance(
     cx: &mut TestAppContext,
 ) {

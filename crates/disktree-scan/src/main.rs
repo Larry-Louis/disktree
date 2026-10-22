@@ -83,9 +83,6 @@ fn limit_resources() -> io::Result<()> {
             maximum: Some(0),
         },
     )?;
-    eprintln!(
-        "Remote scanner memory limit: 1 GiB address space; narrow the scan if exhausted."
-    );
     Ok(())
 }
 

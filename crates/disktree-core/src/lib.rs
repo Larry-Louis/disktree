@@ -18,6 +18,7 @@ mod macos;
 mod mft;
 pub mod payload;
 pub mod remote;
+pub mod remote_progress;
 #[cfg(unix)]
 mod remote_walk;
 pub mod removal;

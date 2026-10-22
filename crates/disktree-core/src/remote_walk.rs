@@ -10,9 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::remote::{Record, send};
 use crate::scan::{ScanOptions, measure, modified_seconds};
 
-// Open directory iterators are a bounded resource too. Fail explicitly,
-// rather than silently truncating an exceptionally deep or hardlinked tree.
-const MAX_ANCESTORS: usize = 256;
+// Only unresolved multiply linked files need a file-identity table.
 const MAX_PENDING_LINKS: usize = 65_536;
 
 struct Frame {
@@ -35,6 +33,7 @@ pub fn stream(
     root: &Path,
     options: &ScanOptions,
     out: &mut impl Write,
+    live_progress: bool,
 ) -> io::Result<()> {
     if options.follow_links || !options.one_filesystem {
         return Err(io::Error::other(
@@ -48,7 +47,7 @@ pub fn stream(
         })?;
     let mut excluded: FxHashSet<PathBuf> = boundaries.into_iter().collect();
     excluded.extend(crate::space::never_scanned(root, root));
-    stream_with_boundaries(root, options, &excluded, out)
+    stream_with_boundaries(root, options, &excluded, out, live_progress)
 }
 
 fn stream_with_boundaries(
@@ -56,17 +55,31 @@ fn stream_with_boundaries(
     options: &ScanOptions,
     excluded: &FxHashSet<PathBuf>,
     out: &mut impl Write,
+    live_progress: bool,
 ) -> io::Result<()> {
     let device = fs::metadata(root)?.dev();
     let mut frames = vec![Frame::open(root, "root".into())];
     // Ordinary single-link files need no identity storage. Forget a shared
     // inode once all its names were met, and bound unmatched identities.
     let mut links = FxHashMap::<(u64, u64), u64>::default();
+    let mut directory = root.to_path_buf();
+    let mut heartbeat = None::<std::time::Instant>;
     while let Some(frame) = frames.last_mut() {
+        if live_progress
+            && heartbeat.is_none_or(|last| {
+                last.elapsed() >= crate::remote_progress::INTERVAL
+            })
+        {
+            send(out, &serde_json::json!({"directory": directory}))?;
+            // Flush on a timer even when few tree records fill the buffer.
+            out.flush()?;
+            heartbeat = Some(std::time::Instant::now());
+        }
         let entry = match frame.entries.as_mut().and_then(Iterator::next) {
             None => {
                 let frame = frames.pop().expect("frame checked above");
                 send(out, &frame.record)?;
+                directory.pop();
                 continue;
             }
             Some(Err(_)) => {
@@ -100,12 +113,8 @@ fn stream_with_boundaries(
             if options.max_depth.is_some_and(|limit| frames.len() > limit) {
                 continue;
             }
-            if frames.len() >= MAX_ANCESTORS {
-                return Err(io::Error::other(
-                    "remote scan nesting limit reached; scan a smaller root",
-                ));
-            }
             frames.last_mut().expect("parent exists").record.6 += 1;
+            directory.clone_from(&path);
             frames.push(Frame::open(&path, name.to_owned()));
             continue;
         }
@@ -131,9 +140,10 @@ fn stream_with_boundaries(
                 }
             } else {
                 if links.len() >= MAX_PENDING_LINKS {
-                    return Err(io::Error::other(
-                        "remote hardlink tracking limit reached; scan a smaller root",
-                    ));
+                    return Err(io::Error::other(format!(
+                        "remote hardlink tracking limit reached at {}; scan a smaller root",
+                        path.display()
+                    )));
                 }
                 links.insert(identity, meta.nlink() - 1);
             }
@@ -170,6 +180,7 @@ mod tests {
             options,
             &excluded.iter().cloned().collect(),
             &mut bytes,
+            false,
         )
         .unwrap();
         bytes
@@ -235,6 +246,21 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_directory_does_not_abort_the_entire_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut path = dir.path().to_path_buf();
+        for _ in 0..320 {
+            path.push("d");
+            fs::create_dir(&path).unwrap();
+        }
+        fs::write(path.join("leaf"), b"found").unwrap();
+        let rows = records(dir.path(), &ScanOptions::default(), &[]);
+        assert_eq!(rows.iter().filter(|row| row.1 == 0).count(), 321);
+        assert!(rows.iter().any(|row| row.0 == "leaf"));
+        assert!(!rows.iter().any(|row| row.5));
+    }
+
+    #[test]
     fn unsafe_traversal_options_fail_before_walking() {
         let dir = tempfile::tempdir().unwrap();
         for options in [
@@ -247,7 +273,9 @@ mod tests {
                 ..ScanOptions::default()
             },
         ] {
-            assert!(stream(dir.path(), &options, &mut Vec::new()).is_err());
+            assert!(
+                stream(dir.path(), &options, &mut Vec::new(), false).is_err()
+            );
         }
     }
 }

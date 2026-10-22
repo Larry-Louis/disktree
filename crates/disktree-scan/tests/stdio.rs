@@ -125,14 +125,28 @@ fn a_live_supervised_client_receives_a_complete_snapshot() {
 #[test]
 fn memory_and_core_limits_are_installed_before_reading_a_request() {
     let mut helper = supervised_helper();
-    let mut notice = String::new();
-    BufReader::new(helper.0.stderr.take().unwrap())
-        .read_line(&mut notice)
-        .unwrap();
-    assert!(notice.contains("memory limit"));
-    let limits =
-        std::fs::read_to_string(format!("/proc/{}/limits", helper.0.id()))
-            .unwrap();
+    // No startup chatter on stderr: wait for the kernel limit itself
+    // while the helper is still blocked waiting for its first request.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let limits = loop {
+        let limits =
+            std::fs::read_to_string(format!("/proc/{}/limits", helper.0.id()))
+                .unwrap();
+        if limits.lines().any(|line| {
+            line.starts_with("Max address space")
+                && line
+                    .split_whitespace()
+                    .nth(3)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|value| value <= 1 << 30)
+        }) {
+            break limits;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        assert!(helper.0.try_wait().unwrap().is_none());
+        std::thread::yield_now();
+    };
     let address = limits
         .lines()
         .find(|line| line.starts_with("Max address space"))
@@ -165,6 +179,7 @@ fn wide_stream_has_bounded_resident_memory() {
         &serde_json::json!({
             "root": dir.path(), "disk": false,
             "options": ScanOptions::default(), "watch_disconnect": true,
+            "live_progress": true,
         }),
     )
     .unwrap();

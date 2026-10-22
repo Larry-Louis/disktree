@@ -329,6 +329,7 @@ pub struct Disktree {
     pub remote: Option<String>,
     remote_disk: bool,
     pub remote_scan: Option<disktree_core::remote::RemoteScan>,
+    pub remote_progress: disktree_core::remote_progress::Progress,
     remote_platform: String,
     pub remote_identity: Option<disktree_core::identity::HostIdentity>,
     pub home: Option<PathBuf>,
@@ -524,6 +525,8 @@ impl Disktree {
             remote,
             remote_disk,
             remote_scan: None,
+            remote_progress: disktree_core::remote_progress::Progress::default(
+            ),
             remote_platform: String::new(),
             remote_identity: None,
             home,
@@ -1236,6 +1239,8 @@ impl Disktree {
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
         self.scan_error = None;
+        self.remote_progress =
+            disktree_core::remote_progress::Progress::default();
         // A new scan starts at its root; where it was is one `<` away.
         if !self.crumbs.is_empty() {
             self.remember();
@@ -1324,7 +1329,13 @@ impl Disktree {
             return false;
         }
         if let Some(scan) = &self.remote_scan {
-            let Some(outcome) = scan.poll() else {
+            let outcome = scan.poll();
+            self.remote_progress = scan.progress();
+            self.progress.files = self.remote_progress.files;
+            self.progress.dirs = self.remote_progress.dirs;
+            self.progress.bytes = self.remote_progress.bytes;
+            self.progress.errors = self.remote_progress.errors;
+            let Some(outcome) = outcome else {
                 cx.notify();
                 return true;
             };

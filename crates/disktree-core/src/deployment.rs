@@ -52,7 +52,17 @@ pub fn deploy(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> io::Result<()> {
+    deploy_with_progress(archive, input, output, |_| {})
+}
+
+pub(crate) fn deploy_with_progress(
+    archive: &Archive,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    mut progress: impl FnMut(crate::remote_progress::Stage),
+) -> io::Result<()> {
     let hello = control_line(input)?;
+    progress(crate::remote_progress::Stage::CheckingHelper);
     let parts: Vec<_> = hello.split_whitespace().collect();
     if parts.len() != 3 || parts[0] != "DISKTREE_BOOTSTRAP_V1" {
         return Err(io::Error::other("unexpected SSH deployment handshake"));
@@ -77,6 +87,7 @@ pub fn deploy(
     output.flush()?;
     let mut state = control_line(input)?;
     if state == "DISKTREE_UPLOAD_V1" {
+        progress(crate::remote_progress::Stage::UploadingHelper);
         output.write_all(&bytes)?;
         output.flush()?;
         state = control_line(input)?;
