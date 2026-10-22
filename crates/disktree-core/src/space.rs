@@ -8,7 +8,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// A volume's capacity in bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SpaceInfo {
     /// Total size of the volume.
     pub total: u64,

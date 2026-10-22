@@ -36,7 +36,7 @@ use crate::tree::{Metric, Node, NodeKind, Seen, aggregate, aggregate_deduped};
 const MAX_ERROR_DETAIL: usize = 50;
 
 /// How a scan measures and filters the tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanOptions {
     /// Measure apparent length instead of allocated blocks. Apparent size is
     /// what `ls -l` shows; blocks are what the volume actually spends, which is
@@ -62,6 +62,7 @@ pub struct ScanOptions {
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
     /// Directory admission for this scan; other scans have their own budget.
+    #[serde(default)]
     pub threads: ScanThreads,
 }
 
