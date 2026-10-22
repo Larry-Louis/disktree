@@ -213,10 +213,13 @@ so outdated helpers reject them instead of silently scanning their home.
 The Linux/macOS helper streams a depth-first walk directly to stdout. It
 never constructs a tree or retains a directory's children: memory scales
 with open ancestors, not file count. Deep directories are not rejected
-at an arbitrary depth; filesystem errors are reported as unreadable. Only pending hardlink
-identities are retained, capped at 65,536; ordinary files need no identity
-storage. A resource limit fails explicitly instead of returning a partial
-tree. Symlinks are not followed and every nested mount is skipped, even a
+at an arbitrary depth; filesystem errors are reported as unreadable.
+Hardlink identities are sent to the desktop, which uses the local scanner's
+compact identity index to count each inode once. The helper keeps no
+per-file identity table in negotiated desktop-de-duplication mode; links
+outside the chosen root cannot fill one. Older clients retain bounded
+helper-side accounting for wire compatibility. A resource limit fails
+explicitly instead of returning a partial tree. Symlinks are not followed and every nested mount is skipped, even a
 bind mount or same-device subvolume. Select those as separate roots.
 
 While indexing, the window shows live files, directories, measured bytes,

@@ -10,7 +10,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::remote::{Record, send};
 use crate::scan::{ScanOptions, measure, modified_seconds};
 
-// Only unresolved multiply linked files need a file-identity table.
+// Legacy peers require helper-side accounting. Modern clients explicitly
+// negotiate desktop de-duplication and never populate this table.
 const MAX_PENDING_LINKS: usize = 65_536;
 
 struct Frame {
@@ -34,6 +35,7 @@ pub fn stream(
     options: &ScanOptions,
     out: &mut impl Write,
     live_progress: bool,
+    client_dedup: bool,
 ) -> io::Result<()> {
     if options.follow_links || !options.one_filesystem {
         return Err(io::Error::other(
@@ -47,7 +49,14 @@ pub fn stream(
         })?;
     let mut excluded: FxHashSet<PathBuf> = boundaries.into_iter().collect();
     excluded.extend(crate::space::never_scanned(root, root));
-    stream_with_boundaries(root, options, &excluded, out, live_progress)
+    stream_with_boundaries(
+        root,
+        options,
+        &excluded,
+        out,
+        live_progress,
+        client_dedup,
+    )
 }
 
 fn stream_with_boundaries(
@@ -56,11 +65,12 @@ fn stream_with_boundaries(
     excluded: &FxHashSet<PathBuf>,
     out: &mut impl Write,
     live_progress: bool,
+    client_dedup: bool,
 ) -> io::Result<()> {
     let device = fs::metadata(root)?.dev();
     let mut frames = vec![Frame::open(root, "root".into())];
-    // Ordinary single-link files need no identity storage. Forget a shared
-    // inode once all its names were met, and bound unmatched identities.
+    // Only the legacy wire mode needs a table. Modern sessions emit each
+    // hardlink's identity directly and leave this map empty.
     let mut links = FxHashMap::<(u64, u64), u64>::default();
     let mut directory = root.to_path_buf();
     let mut heartbeat = None::<std::time::Instant>;
@@ -130,7 +140,9 @@ fn stream_with_boundaries(
         } else {
             measure(&meta, options.apparent_size)
         };
-        if options.dedup_hardlinks && meta.is_file() && meta.nlink() > 1 {
+        let hardlinked =
+            options.dedup_hardlinks && meta.is_file() && meta.nlink() > 1;
+        if hardlinked && !client_dedup {
             let identity = (meta.dev(), meta.ino());
             if let Some(remaining) = links.get_mut(&identity) {
                 bytes = 0;
@@ -148,18 +160,33 @@ fn stream_with_boundaries(
                 links.insert(identity, meta.nlink() - 1);
             }
         }
-        send(
-            out,
-            &Record(
-                name.to_owned(),
-                kind,
-                bytes,
-                u64::from(meta.is_file()),
-                modified_seconds(&meta),
-                false,
-                0,
-            ),
-        )?;
+        let record = Record(
+            name.to_owned(),
+            kind,
+            bytes,
+            u64::from(meta.is_file()),
+            modified_seconds(&meta),
+            false,
+            0,
+        );
+        if hardlinked && client_dedup {
+            // The desktop already owns the tree and its compact identity
+            // index. The server retains no per-file state in this mode.
+            #[derive(serde::Serialize)]
+            struct Linked<'a> {
+                link: (u64, u64),
+                entry: &'a Record,
+            }
+            send(
+                out,
+                &Linked {
+                    link: (meta.dev(), meta.ino()),
+                    entry: &record,
+                },
+            )?;
+        } else {
+            send(out, &record)?;
+        }
         frames.last_mut().expect("parent exists").record.6 += 1;
     }
     Ok(())
@@ -180,6 +207,7 @@ mod tests {
             options,
             &excluded.iter().cloned().collect(),
             &mut bytes,
+            false,
             false,
         )
         .unwrap();
@@ -274,7 +302,8 @@ mod tests {
             },
         ] {
             assert!(
-                stream(dir.path(), &options, &mut Vec::new(), false).is_err()
+                stream(dir.path(), &options, &mut Vec::new(), false, false)
+                    .is_err()
             );
         }
     }

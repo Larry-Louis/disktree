@@ -172,14 +172,36 @@ fn wide_stream_has_bounded_resident_memory() {
         std::fs::File::create(dir.path().join(format!("file-{index:06}")))
             .unwrap();
     }
+    assert_bounded_stream_memory(dir.path());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "creates 70,000 hardlinks to inodes outside the scanned fixture"]
+fn external_hardlinks_have_bounded_resident_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    for index in 0..70_000 {
+        let file = outside.join(format!("file-{index}"));
+        std::fs::File::create(&file).unwrap();
+        std::fs::hard_link(&file, root.join(format!("file-{index}"))).unwrap();
+    }
+    assert_bounded_stream_memory(&root);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_bounded_stream_memory(root: &std::path::Path) {
     let mut helper = supervised_helper();
     let mut input = helper.0.stdin.take().unwrap();
     serde_json::to_writer(
         &mut input,
         &serde_json::json!({
-            "root": dir.path(), "disk": false,
+            "root": root, "disk": false,
             "options": ScanOptions::default(), "watch_disconnect": true,
-            "live_progress": true,
+            "live_progress": true, "client_dedup": true,
         }),
     )
     .unwrap();

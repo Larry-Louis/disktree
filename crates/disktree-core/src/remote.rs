@@ -62,6 +62,8 @@ pub struct SessionRequest {
     // Opt-in keeps the postorder-only wire format for older clients.
     #[serde(default)]
     pub live_progress: bool,
+    #[serde(default)]
+    pub client_dedup: bool,
 }
 
 /// The target's root candidates, without walking or probing any of them.
@@ -119,6 +121,13 @@ pub(crate) struct Record(
     pub usize,
 );
 
+#[derive(Deserialize)]
+struct Control {
+    directory: Option<PathBuf>,
+    entry: Option<Record>,
+    link: Option<(u64, u64)>,
+}
+
 fn json_error(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -135,9 +144,15 @@ fn receive<T: serde::de::DeserializeOwned>(
     input: &mut impl BufRead,
 ) -> io::Result<T> {
     let mut line = String::new();
+    receive_line(input, &mut line)?;
+    serde_json::from_str(&line).map_err(json_error)
+}
+
+fn receive_line(input: &mut impl BufRead, line: &mut String) -> io::Result<()> {
+    line.clear();
     // A remote process is not trusted to allocate arbitrary amounts of RAM
     // with a single malformed record (or an accidental login banner).
-    let length = input.take(MAX_LINE).read_line(&mut line)?;
+    let length = input.take(MAX_LINE).read_line(line)?;
     if length == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -152,7 +167,7 @@ fn receive<T: serde::de::DeserializeOwned>(
         };
         return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
     }
-    serde_json::from_str(&line).map_err(json_error)
+    Ok(())
 }
 
 /// Only read-only discovery and scans: no command execution or removal.
@@ -171,9 +186,12 @@ pub fn serve_session(
     out: &mut impl Write,
 ) -> io::Result<()> {
     match session.operation {
-        Operation::Scan(request) => {
-            serve_request_with_progress(request, out, session.live_progress)
-        }
+        Operation::Scan(request) => serve_request_with_progress(
+            request,
+            out,
+            session.live_progress,
+            session.client_dedup,
+        ),
         Operation::Discover { discover_version } => {
             if discover_version != VERSION {
                 return Err(io::Error::other(
@@ -197,15 +215,16 @@ pub fn serve_session(
 
 /// Scan a decoded request. The standalone helper supervises its lifetime.
 pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
-    serve_request_with_progress(request, out, false)
+    serve_request_with_progress(request, out, false, false)
 }
 
 fn serve_request_with_progress(
     request: Request,
     out: &mut impl Write,
     live_progress: bool,
+    client_dedup: bool,
 ) -> io::Result<()> {
-    let _ = live_progress; // Only Unix has the streaming walker.
+    let _ = (live_progress, client_dedup); // Only Unix has the streaming walker.
     let home = std::env::home_dir();
     let root = request
         .root
@@ -234,7 +253,13 @@ fn serve_request_with_progress(
     )?;
     out.flush()?;
     #[cfg(unix)]
-    crate::remote_walk::stream(&root, &request.options, out, live_progress)?;
+    crate::remote_walk::stream(
+        &root,
+        &request.options,
+        out,
+        live_progress,
+        client_dedup,
+    )?;
     #[cfg(not(unix))]
     write_node(out, &scan(&root, request.options)?)?;
     // An explicit terminator distinguishes a complete scan from a severed SSH
@@ -293,23 +318,48 @@ fn read_snapshot_with_progress(
     *shared.lock().expect("remote progress lock") = progress.clone();
     let mut published = Instant::now();
     let mut stack = Vec::<Node>::new();
+    let mut line = String::new();
+    let seen = crate::tree::Seen::new();
     loop {
-        let value: serde_json::Value = receive(input)?;
-        if value == "done" {
+        receive_line(input, &mut line)?;
+        let text = line.trim_start();
+        // The common path is a typed tuple, not a heap-allocated JSON DOM
+        // followed by another deserialization. Reuse the line allocation.
+        let record: Record = if text.starts_with('[') {
+            serde_json::from_str(text).map_err(json_error)?
+        } else if text.starts_with('{') {
+            let control: Control =
+                serde_json::from_str(text).map_err(json_error)?;
+            if let Some(directory) = control.directory {
+                progress.directory = Some(directory);
+                progress.updated = Some(Instant::now());
+                *shared.lock().expect("remote progress lock") =
+                    progress.clone();
+                published = Instant::now();
+                continue;
+            }
+            let mut entry = control.entry.ok_or_else(|| {
+                io::Error::other("invalid remote control record")
+            })?;
+            let identity = control.link.ok_or_else(|| {
+                io::Error::other("missing remote hardlink identity")
+            })?;
+            if entry.1 != 1 || entry.6 != 0 {
+                return Err(io::Error::other("invalid remote hardlink entry"));
+            }
+            if entry.2 > 0 && !seen.insert(identity) {
+                entry.2 = 0;
+            }
+            entry
+        } else if serde_json::from_str::<String>(text).map_err(json_error)?
+            == "done"
+        {
             break;
-        }
-        if let Some(directory) = value.get("directory") {
-            progress.directory = Some(
-                serde_json::from_value(directory.clone())
-                    .map_err(json_error)?,
-            );
-            progress.updated = Some(Instant::now());
-            *shared.lock().expect("remote progress lock") = progress.clone();
-            published = Instant::now();
-            continue;
-        }
+        } else {
+            return Err(io::Error::other("invalid remote stream marker"));
+        };
         let Record(name, kind, bytes, files, modified, read_error, count) =
-            serde_json::from_value(value).map_err(json_error)?;
+            record;
         // Names must remain single components when joined to marked paths.
         if name.is_empty()
             || name == "."
@@ -579,6 +629,7 @@ impl<T: Send + 'static> RemoteJob<T> {
                         operation,
                         watch_disconnect: true,
                         live_progress: true,
+                        client_dedup: true,
                     },
                 )?;
                 decode(&mut input, &live)
@@ -721,6 +772,7 @@ mod tests {
             },
             watch_disconnect: true,
             live_progress: true,
+            client_dedup: true,
         };
         let bytes = serde_json::to_vec(&session).unwrap();
         assert!(serde_json::from_slice::<Request>(&bytes).is_err());
@@ -1070,6 +1122,85 @@ mod tests {
         let snapshot = worker.join().unwrap().unwrap();
         assert_eq!(snapshot.tree.bytes, 5);
         assert_eq!(shared.lock().unwrap().stage, Stage::Finalizing);
+    }
+
+    #[test]
+    fn desktop_dedup_counts_links_once_without_requiring_external_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("first"), b"hello").unwrap();
+        std::fs::hard_link(root.join("first"), root.join("alias")).unwrap();
+        std::fs::hard_link(root.join("first"), dir.path().join("outside"))
+            .unwrap();
+        for dedup in [true, false] {
+            let session = SessionRequest {
+                operation: Operation::Scan(Request {
+                    root: Some(root.clone()),
+                    disk: false,
+                    options: ScanOptions {
+                        apparent_size: true,
+                        dedup_hardlinks: dedup,
+                        ..ScanOptions::default()
+                    },
+                }),
+                live_progress: true,
+                client_dedup: true,
+                watch_disconnect: false,
+            };
+            let mut data = Vec::new();
+            serve_session(session, &mut data).unwrap();
+            let snapshot = read_snapshot(&mut data.as_slice()).unwrap();
+            assert_eq!(snapshot.tree.bytes, if dedup { 5 } else { 10 });
+            assert_eq!(snapshot.tree.files, 2);
+        }
+    }
+
+    #[test]
+    fn desktop_dedup_accepts_more_than_the_old_pending_link_limit() {
+        let mut data = Vec::new();
+        send(
+            &mut data,
+            &Header {
+                version: VERSION,
+                root: std::env::temp_dir().join("links-test"),
+                home: None,
+                disk_root: None,
+                space: None,
+                platform: std::env::consts::OS.into(),
+                identity: None,
+            },
+        )
+        .unwrap();
+        let count = 65_537_u64;
+        for index in 0..=count {
+            let inode = if index == count { 42 } else { index };
+            send(
+                &mut data,
+                &serde_json::json!({
+                    "link": [7, inode],
+                    "entry": [format!("file-{index}"), 1, 1, 1, 0, false, 0],
+                }),
+            )
+            .unwrap();
+        }
+        send(
+            &mut data,
+            &Record(
+                "root".into(),
+                0,
+                0,
+                0,
+                0,
+                false,
+                usize::try_from(count + 1).unwrap(),
+            ),
+        )
+        .unwrap();
+        send(&mut data, &"done").unwrap();
+        let snapshot = read_snapshot(&mut data.as_slice()).unwrap();
+        assert_eq!(snapshot.tree.files, count + 1);
+        assert_eq!(snapshot.tree.bytes, count);
     }
 
     #[test]
