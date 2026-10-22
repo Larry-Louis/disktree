@@ -312,7 +312,8 @@ fn parse_args_with_power(
     let mut args = args.peekable();
     let remote = if args.peek().is_some_and(|arg| arg == "ssh") {
         args.next();
-        let host = text(args.next(), "ssh needs a host, e.g. disktree ssh dev")?;
+        let host =
+            text(args.next(), "ssh needs a host, e.g. disktree ssh dev")?;
         disktree_core::remote::validate_host(&host)?;
         Some(host)
     } else {

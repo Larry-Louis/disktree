@@ -2294,7 +2294,9 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
 
 /// What the viewport shows while the first scan is running.
 fn scanning_panel(
-    app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>,
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
 ) -> Div {
     if let Some(error) = &app.scan_error {
         return div()
@@ -2331,7 +2333,8 @@ fn scanning_panel(
             .child(widgets::hint("r", "retry scan", cx));
     }
     let progress = &app.progress;
-    let cancelled = app.scan.is_none() && app.remote_scan.is_none() && progress.cancelled;
+    let cancelled =
+        app.scan.is_none() && app.remote_scan.is_none() && progress.cancelled;
     div()
         .debug_selector(|| "scan-reading".into())
         .flex()

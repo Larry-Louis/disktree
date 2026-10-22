@@ -50,6 +50,17 @@ the release binary:
 yay -S disktree-bin
 ```
 
+If another installed version wins on `PATH`, the installer warns which one.
+Run `export PATH="$HOME/.local/bin:$PATH"` and add that setting to your shell
+configuration so the locally installed build takes precedence.
+
+For Linux builds with embedded SSH helpers, also install the two Rust
+standard-library targets (no external C cross-compiler is needed):
+
+```sh
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+```
+
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan). Distributions often package an older Rust;
 [rustup](https://rustup.rs) installs a current one. The repo pins 1.97 in
@@ -132,6 +143,104 @@ disktree --disk     # the whole disk it lives on
 disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
+
+### Servers over SSH (read-only)
+
+```sh
+disktree ssh dev                 # remote home; dev is an SSH config alias
+disktree ssh user@server /var    # an explicit remote path
+disktree ssh dev --disk          # the disk containing the remote home
+disktree ssh dev -a /srv         # apparent size instead of allocated blocks
+```
+
+Linux builds made with `make build` / `cargo xtask portable` include static
+**x86-64 and ARM64 Linux scanners appended to the executable**. SSH detects
+the server's OS/CPU and uploads the matching scanner only when its checked
+cache is missing or damaged. The cache is private and content-addressed under
+`~/.cache/disktree/ssh/<sha256>/` (or the server's `XDG_CACHE_HOME`).
+Uploads are checksum-verified and atomically installed; there is no sudo,
+system-package change or dependency on the server's glibc version.
+
+This uses stable Rust's musl targets rather than Cosmopolitan: the existing
+Rust/rayon/rustix scanner has no supported stable Cosmopolitan target. These
+are Linux binaries, not a single executable for every OS; ARM64 is built and
+ELF-validated, while x86-64 was also executed against a real server.
+
+You can extract a helper without opening a window, or test the entire
+SSH/deployment/scan path headlessly:
+
+```sh
+disktree extract-scanner x86_64 ./disktree-scan
+disktree extract-scanner aarch64 ./disktree-scan-arm64
+disktree ssh dev --check /var/log
+```
+
+The appended manifest stores architecture, byte ranges and SHA-256 hashes.
+Do not run `strip` after packaging: it discards the trailer. The Linux release
+pipeline strips first, embeds last, and ships that single file. Appending to
+signed macOS/Windows executables needs platform-specific signature handling;
+those builds do not yet embed helpers.
+
+For a development or non-Linux desktop build without the trailer, install
+the small **disktree-scan** helper on the server first:
+
+```sh
+# On the server, inside the checkout:
+make install-scan               # ~/.local/bin/disktree-scan; no GUI deps
+# Or:
+cargo install --path crates/disktree-scan --locked
+```
+
+The helper can be on the server's **non-interactive SSH PATH** or at
+`~/.local/bin/disktree-scan` (the default install location); disktree tries
+both. A binary copied from another machine must match the server's OS,
+architecture and runtime. The manually built native helper may need the
+server's libc; the embedded Linux helpers are static. Disktree never runs
+sudo or changes the server's configuration.
+SSH keeps your normal authentication settings. When launched from a
+terminal, it can ask for a password or key passphrase there; GUI launches
+need key/agent access or a working SSH askpass helper. Connect once with
+`ssh dev` to verify access and accept its host key.
+
+The headless helper reuses the parallel scanner: allocated blocks, hardlink
+deduplication, hidden entries and mount boundaries have the same semantics as
+a local scan. One compressed SSH connection carries a versioned JSON request
+on stdin and compact postorder records on stdout. File contents never cross
+the connection, and paths are never interpolated into a remote shell command.
+The complete tree is retained for offline navigation; very large trees still
+require memory proportional to their entry count.
+
+Remote mode is **export-only**. Mark with Space, open review with `c`, then:
+
+- **Copy as prompt** (`a`): includes the SSH host, remote OS, scan root,
+  selected paths, sizes and cleanup precautions. It requires verifying the
+  actual scanned hostname and machine ID before any destructive operation,
+  and stopping if either check fails or cannot be performed.
+- **Save list…** (`s`): remote paths, one per line, saved locally.
+- **Copy delete script** (`y`), or **Save delete script…** (`e`): a
+  GNU/Linux shell script, copied to the clipboard or saved locally.
+  Running it without arguments only previews the selection. After reviewing
+  it, `sh disktree-delete.sh --delete` connects to the named SSH host and
+  runs the exported commands there, never against the local paths.
+
+There are no trash/delete buttons or removal-mode choices in remote review.
+Deletion shortcuts and removal entry points are disabled too. Git inspection,
+local folder selection and file-manager reveal are disabled so remote names
+cannot accidentally act on this computer. Free space is sampled when the
+scan completes, **not live**; press `r` to refresh.
+
+Before deleting, scripts compare the server's actual kernel hostname and
+machine ID against the identity captured in the scan—not the SSH alias.
+Missing identity or any mismatch aborts. The check runs on the SSH target,
+not the computer launching the wrapper. Pasting the script previews it by
+default and runs in a subshell, so its exit cannot close your terminal.
+
+Exports are not an automatic cleanup recommendation. Scripts refuse system
+paths, the scan root, home or its ancestors, symlinked/changed canonical paths,
+and paths containing mount points. Control-character names are omitted.
+These checks do not eliminate filesystem races or tell you whether git work
+is backed up; review the script and prefer a tool's own cleanup command for
+tool-owned data. The remote helper itself has no delete operation.
 
 ### The screen
 
@@ -389,6 +498,7 @@ windowrule = size 1400 900, class:^(disktree)$
 make run      # release build, scanning $HOME
 make lint     # rustfmt --check, then clippy with every warning an error
 make test     # scanner, layout and removal tests, plus window-harness tests
+make test-ssh # real localhost SSH scans/errors; Linux, bun + openssh required
 make ci       # lint, then test
 ```
 
