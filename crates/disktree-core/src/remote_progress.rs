@@ -36,6 +36,7 @@ pub struct Progress {
     pub errors: u64,
     pub directory: Option<PathBuf>,
     pub updated: Option<Instant>,
+    pub preview: Option<Arc<crate::scan_preview::Preview>>,
 }
 
 /// Cap both wire heartbeats and UI publications at five per second.

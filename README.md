@@ -219,11 +219,23 @@ compact identity index to count each inode once. The helper keeps no
 per-file identity table in negotiated desktop-de-duplication mode; links
 outside the chosen root cannot fill one. Older clients retain bounded
 helper-side accounting for wire compatibility. A resource limit fails
-explicitly instead of returning a partial tree. Symlinks are not followed and every nested mount is skipped, even a
-bind mount or same-device subvolume. Select those as separate roots.
+explicitly instead of returning a partial tree. Symlinks are not followed,
+and every nested mount is skipped, even a bind mount or same-device
+subvolume. Select those as separate roots.
 
-While indexing, the window shows live files, directories, measured bytes,
-read errors, elapsed time and average throughput. Remote scans also show a
+While indexing, a quiet sidebar shows live files, directories, measured
+bytes, read errors and elapsed time. Counters and paths use monospace type
+in fixed lanes; changing values do not re-center or reflow the screen.
+Narrow windows use a compact progress footer instead.
+
+Ordinary local walks and current SSH helpers paint a **live top-level
+overview** before the full tree arrives. These are measured contributions,
+not complete directory sizes. Updates are limited to once a second, in
+arrival order, with at most 128 named buckets plus an overflow bucket. The
+preview is kept separate from the real tree: it cannot be navigated,
+marked or removed. On completion the full, actionable treemap replaces it;
+on error or cancellation the preview is discarded. The Windows file-table
+fast path still waits for its complete tree. Remote scans also show a
 sampled recent directory and connection / helper setup / indexing / treemap
 stages. Progress uses a single replaceable snapshot, not a growing event
 queue; path updates are throttled to five per second. There is no guessed

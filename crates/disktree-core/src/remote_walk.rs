@@ -36,6 +36,7 @@ pub fn stream(
     out: &mut impl Write,
     live_progress: bool,
     client_dedup: bool,
+    live_tree: bool,
 ) -> io::Result<()> {
     if options.follow_links || !options.one_filesystem {
         return Err(io::Error::other(
@@ -56,6 +57,7 @@ pub fn stream(
         out,
         live_progress,
         client_dedup,
+        live_tree,
     )
 }
 
@@ -66,7 +68,11 @@ fn stream_with_boundaries(
     out: &mut impl Write,
     live_progress: bool,
     client_dedup: bool,
+    live_tree: bool,
 ) -> io::Result<()> {
+    if live_tree {
+        send(out, &serde_json::json!({"enter": ""}))?;
+    }
     let device = fs::metadata(root)?.dev();
     let mut frames = vec![Frame::open(root, "root".into())];
     // Only the legacy wire mode needs a table. Modern sessions emit each
@@ -125,6 +131,9 @@ fn stream_with_boundaries(
             }
             frames.last_mut().expect("parent exists").record.6 += 1;
             directory.clone_from(&path);
+            if live_tree {
+                send(out, &serde_json::json!({"enter": name}))?;
+            }
             frames.push(Frame::open(&path, name.to_owned()));
             continue;
         }
@@ -207,6 +216,7 @@ mod tests {
             options,
             &excluded.iter().cloned().collect(),
             &mut bytes,
+            false,
             false,
             false,
         )
@@ -302,8 +312,15 @@ mod tests {
             },
         ] {
             assert!(
-                stream(dir.path(), &options, &mut Vec::new(), false, false)
-                    .is_err()
+                stream(
+                    dir.path(),
+                    &options,
+                    &mut Vec::new(),
+                    false,
+                    false,
+                    false
+                )
+                .is_err()
             );
         }
     }

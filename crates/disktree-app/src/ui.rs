@@ -61,7 +61,6 @@ pub mod icon {
 
     pub const SM: Rems = Rems(0.75);
     pub const MD: Rems = Rems(0.875);
-    pub const LG: Rems = Rems(1.375);
 }
 
 /// Region and lane widths. Each is the comfortable default for its content at
@@ -84,7 +83,9 @@ pub mod size {
     pub const SWATCH: Rems = Rems(0.625);
     /// A thin meter: share of the scan, the disk.
     pub const METER: Rems = Rems(0.3125);
-    /// The meter on the scanning panel.
+    /// Fixed progress rows keep paths and changing counters from reflowing.
+    pub const PROGRESS_ROW: Rems = Rems(1.375);
+    pub const PROGRESS_VALUE: Rems = Rems(9.0);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.

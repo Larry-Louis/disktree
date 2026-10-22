@@ -330,6 +330,8 @@ pub struct Disktree {
     remote_disk: bool,
     pub remote_scan: Option<disktree_core::remote::RemoteScan>,
     pub remote_progress: disktree_core::remote_progress::Progress,
+    pub scan_preview: Option<Arc<disktree_core::scan_preview::Preview>>,
+    preview_updated: Option<Instant>,
     remote_platform: String,
     pub remote_identity: Option<disktree_core::identity::HostIdentity>,
     pub home: Option<PathBuf>,
@@ -525,6 +527,8 @@ impl Disktree {
             remote,
             remote_disk,
             remote_scan: None,
+            scan_preview: None,
+            preview_updated: None,
             remote_progress: disktree_core::remote_progress::Progress::default(
             ),
             remote_platform: String::new(),
@@ -1104,6 +1108,7 @@ impl Disktree {
     /// were the whole one: a first scan leaves the panel saying it stopped,
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
+        self.scan_preview = None;
         if self.remote_scan.take().is_some() {
             self.scan_epoch += 1;
             self.progress.cancelled = true;
@@ -1241,6 +1246,8 @@ impl Disktree {
         self.scan_error = None;
         self.remote_progress =
             disktree_core::remote_progress::Progress::default();
+        self.scan_preview = None;
+        self.preview_updated = None;
         // A new scan starts at its root; where it was is one `<` away.
         if !self.crumbs.is_empty() {
             self.remember();
@@ -1331,6 +1338,7 @@ impl Disktree {
         if let Some(scan) = &self.remote_scan {
             let outcome = scan.poll();
             self.remote_progress = scan.progress();
+            self.scan_preview.clone_from(&self.remote_progress.preview);
             self.progress.files = self.remote_progress.files;
             self.progress.dirs = self.remote_progress.dirs;
             self.progress.bytes = self.remote_progress.bytes;
@@ -1366,6 +1374,7 @@ impl Disktree {
                 }
             }
             self.remote_scan = None;
+            self.scan_preview = None;
             self.progress.finished = true;
             cx.notify();
             return false;
@@ -1374,6 +1383,16 @@ impl Disktree {
             return false;
         };
         self.progress = scan.progress.snapshot();
+        if self
+            .preview_updated
+            .is_none_or(|at| at.elapsed().as_secs() >= 1)
+        {
+            let preview = scan.progress.preview();
+            if !preview.entries.is_empty() {
+                self.scan_preview = Some(Arc::new(preview));
+                self.preview_updated = Some(Instant::now());
+            }
+        }
         let Some(outcome) = scan.poll() else {
             cx.notify();
             return true;
@@ -1415,6 +1434,7 @@ impl Disktree {
             Err(error) => self.scan_error = Some(error.to_string()),
         }
         self.scan = None;
+        self.scan_preview = None;
         self.progress.finished = true;
         cx.notify();
         false
@@ -1474,6 +1494,10 @@ impl Disktree {
     }
 
     // ── navigation ──────────────────────────────────────────────────────
+
+    pub const fn is_indexing(&self) -> bool {
+        self.scan.is_some() || self.remote_scan.is_some()
+    }
 
     pub fn tree(&self) -> Option<&Node> {
         self.tree.as_deref()

@@ -95,6 +95,8 @@ pub struct ScanProgress {
     finished: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
+    preview_root: OnceLock<PathBuf>,
+    preview: Mutex<crate::scan_preview::Builder>,
     pub(crate) threads: AtomicUsize,
     pub(crate) threads_settled: AtomicBool,
     pub(crate) thread_tuning_complete: AtomicBool,
@@ -122,6 +124,26 @@ pub struct ScanSnapshot {
 }
 
 impl ScanProgress {
+    pub fn preview(&self) -> crate::scan_preview::Preview {
+        lock(&self.preview).snapshot()
+    }
+
+    fn preview_add(&self, path: &Path, bytes: u64, files: u64) {
+        let Some(root) = self.preview_root.get() else {
+            return;
+        };
+        let Ok(below) = path.strip_prefix(root) else {
+            return;
+        };
+        let name = below
+            .components()
+            .next()
+            .map(|part| part.as_os_str().to_string_lossy());
+        let mut preview = lock(&self.preview);
+        preview.add(name.as_deref(), bytes, files);
+        preview.directory(path);
+    }
+
     pub(crate) fn entries(&self) -> u64 {
         self.files.load(Ordering::Relaxed) + self.dirs.load(Ordering::Relaxed)
     }
@@ -825,6 +847,7 @@ impl PendingDir {
 }
 
 fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
+    let _ = context.progress.preview_root.set(root.to_path_buf());
     let owned = fixed_pool(context.options.threads)?;
     let pool = owned.as_ref().unwrap_or_else(|| &WALK_POOL);
     scan_on_pool(root, context, pool)
@@ -1021,7 +1044,8 @@ impl Tally {
         self.bytes += node.bytes;
     }
 
-    fn flush(&mut self, progress: &ScanProgress) {
+    fn flush(&mut self, progress: &ScanProgress, path: &Path) {
+        progress.preview_add(path, self.bytes, self.files);
         progress.add(self.files, self.dirs, self.bytes);
         *self = Self::default();
     }
@@ -1103,7 +1127,7 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                             Classified::Skipped => {}
                         }
                         if tally.files + tally.dirs >= TALLY_EVERY {
-                            tally.flush(&context.progress);
+                            tally.flush(&context.progress, &dir.path);
                         }
                     }
                     Err(error) => {
@@ -1117,7 +1141,7 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
             dir.read_error.store(true, Ordering::Relaxed);
         }
     }
-    tally.flush(&context.progress);
+    tally.flush(&context.progress, &dir.path);
 
     // A depth-limited scan still measures what is directly in the directory,
     // it just does not descend further.
@@ -1779,6 +1803,23 @@ mod tests {
         assert!(snapshot.finished);
         assert_eq!(snapshot.files, 2);
         assert_eq!(snapshot.errors, 0);
+        let preview = handle.progress.preview();
+        assert!(
+            preview
+                .entries
+                .iter()
+                .any(|e| e.name == "a" && e.bytes == 1024)
+        );
+        assert!(
+            preview
+                .entries
+                .iter()
+                .any(|e| e.name == "b" && e.bytes == 2048)
+        );
+        assert_eq!(
+            preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
+            tree.bytes
+        );
     }
 
     #[test]

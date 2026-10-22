@@ -23,6 +23,7 @@ pub mod remote_progress;
 mod remote_walk;
 pub mod removal;
 pub mod scan;
+pub mod scan_preview;
 pub mod scan_threads;
 pub mod size;
 pub mod space;

@@ -64,6 +64,8 @@ pub struct SessionRequest {
     pub live_progress: bool,
     #[serde(default)]
     pub client_dedup: bool,
+    #[serde(default)]
+    pub live_tree: bool,
 }
 
 /// The target's root candidates, without walking or probing any of them.
@@ -124,6 +126,7 @@ pub(crate) struct Record(
 #[derive(Deserialize)]
 struct Control {
     directory: Option<PathBuf>,
+    enter: Option<String>,
     entry: Option<Record>,
     link: Option<(u64, u64)>,
 }
@@ -191,6 +194,7 @@ pub fn serve_session(
             out,
             session.live_progress,
             session.client_dedup,
+            session.live_tree,
         ),
         Operation::Discover { discover_version } => {
             if discover_version != VERSION {
@@ -215,7 +219,7 @@ pub fn serve_session(
 
 /// Scan a decoded request. The standalone helper supervises its lifetime.
 pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
-    serve_request_with_progress(request, out, false, false)
+    serve_request_with_progress(request, out, false, false, false)
 }
 
 fn serve_request_with_progress(
@@ -223,8 +227,9 @@ fn serve_request_with_progress(
     out: &mut impl Write,
     live_progress: bool,
     client_dedup: bool,
+    live_tree: bool,
 ) -> io::Result<()> {
-    let _ = (live_progress, client_dedup); // Only Unix has the streaming walker.
+    let _ = (live_progress, client_dedup, live_tree); // Only Unix has the streaming walker.
     let home = std::env::home_dir();
     let root = request
         .root
@@ -259,6 +264,7 @@ fn serve_request_with_progress(
         out,
         live_progress,
         client_dedup,
+        live_tree,
     )?;
     #[cfg(not(unix))]
     write_node(out, &scan(&root, request.options)?)?;
@@ -320,6 +326,9 @@ fn read_snapshot_with_progress(
     let mut stack = Vec::<Node>::new();
     let mut line = String::new();
     let seen = crate::tree::Seen::new();
+    let mut preview = crate::scan_preview::Builder::default();
+    let mut ancestors = Vec::<String>::new();
+    let mut preview_published = Instant::now();
     loop {
         receive_line(input, &mut line)?;
         let text = line.trim_start();
@@ -330,6 +339,19 @@ fn read_snapshot_with_progress(
         } else if text.starts_with('{') {
             let control: Control =
                 serde_json::from_str(text).map_err(json_error)?;
+            if let Some(name) = control.enter {
+                if !(name.is_empty() && ancestors.is_empty())
+                    && (name.is_empty()
+                        || name == "."
+                        || name == ".."
+                        || name.contains(['/', '\0'])
+                        || (cfg!(windows) && name.contains(['\\', ':'])))
+                {
+                    return Err(io::Error::other("invalid preview directory"));
+                }
+                ancestors.push(name);
+                continue;
+            }
             if let Some(directory) = control.directory {
                 progress.directory = Some(directory);
                 progress.updated = Some(Instant::now());
@@ -401,6 +423,18 @@ fn read_snapshot_with_progress(
         node.read_error = read_error;
         node.children = children;
         stack.push(node);
+        let mut preview_changed = false;
+        if !ancestors.is_empty() {
+            if kind.is_dir() {
+                ancestors.pop();
+            } else {
+                preview.add(ancestors.get(1).map(String::as_str), bytes, files);
+                if progress.preview.is_none() {
+                    progress.preview = Some(Arc::new(preview.snapshot()));
+                    preview_changed = true;
+                }
+            }
+        }
         progress.dirs += u64::from(kind.is_dir());
         // Legacy helpers include direct totals in directory records too.
         // Count each leaf once, never charge its parent's totals again.
@@ -409,11 +443,20 @@ fn read_snapshot_with_progress(
             progress.bytes += bytes;
         }
         progress.errors += u64::from(read_error);
-        if published.elapsed() >= INTERVAL {
+        if published.elapsed() >= INTERVAL || preview_changed {
+            if progress.preview.is_some()
+                && preview_published.elapsed().as_secs() >= 1
+            {
+                progress.preview = Some(Arc::new(preview.snapshot()));
+                preview_published = Instant::now();
+            }
             progress.updated = Some(Instant::now());
             *shared.lock().expect("remote progress lock") = progress.clone();
             published = Instant::now();
         }
+    }
+    if progress.preview.is_some() {
+        progress.preview = Some(Arc::new(preview.snapshot()));
     }
     progress.stage = Stage::Finalizing;
     progress.updated = Some(Instant::now());
@@ -630,6 +673,7 @@ impl<T: Send + 'static> RemoteJob<T> {
                         watch_disconnect: true,
                         live_progress: true,
                         client_dedup: true,
+                        live_tree: true,
                     },
                 )?;
                 decode(&mut input, &live)
@@ -773,6 +817,7 @@ mod tests {
             watch_disconnect: true,
             live_progress: true,
             client_dedup: true,
+            live_tree: true,
         };
         let bytes = serde_json::to_vec(&session).unwrap();
         assert!(serde_json::from_slice::<Request>(&bytes).is_err());
@@ -1103,6 +1148,7 @@ mod tests {
             read_snapshot_with_progress(&mut BufReader::new(input), &live)
         });
         output.write_all(header).unwrap();
+        send(&mut output, &serde_json::json!({"enter": ""})).unwrap();
         output.write_all(leaf).unwrap();
         send(&mut output, &serde_json::json!({"directory": dir.path()}))
             .unwrap();
@@ -1112,6 +1158,10 @@ mod tests {
             if progress.files == 1 {
                 assert_eq!(progress.bytes, 5);
                 assert_eq!(progress.stage, Stage::Indexing);
+                let preview =
+                    progress.preview.as_ref().expect("preview before done");
+                assert_eq!(preview.entries[0].bytes, 5);
+                assert_eq!(preview.entries[0].name, "Files in root");
                 assert!(!worker.is_finished());
                 break;
             }
@@ -1133,6 +1183,8 @@ mod tests {
         std::fs::hard_link(root.join("first"), root.join("alias")).unwrap();
         std::fs::hard_link(root.join("first"), dir.path().join("outside"))
             .unwrap();
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::write(root.join("nested/deeper/file"), b"world").unwrap();
         for dedup in [true, false] {
             let session = SessionRequest {
                 operation: Operation::Scan(Request {
@@ -1146,13 +1198,29 @@ mod tests {
                 }),
                 live_progress: true,
                 client_dedup: true,
+                live_tree: true,
                 watch_disconnect: false,
             };
             let mut data = Vec::new();
             serve_session(session, &mut data).unwrap();
-            let snapshot = read_snapshot(&mut data.as_slice()).unwrap();
-            assert_eq!(snapshot.tree.bytes, if dedup { 5 } else { 10 });
-            assert_eq!(snapshot.tree.files, 2);
+            let shared = Shared::default();
+            let snapshot =
+                read_snapshot_with_progress(&mut data.as_slice(), &shared)
+                    .unwrap();
+            assert_eq!(snapshot.tree.bytes, if dedup { 10 } else { 15 });
+            assert_eq!(snapshot.tree.files, 3);
+            let preview = shared.lock().unwrap().preview.clone().unwrap();
+            let nested = preview
+                .entries
+                .iter()
+                .find(|entry| entry.name == "nested")
+                .unwrap();
+            assert_eq!(nested.bytes, 5);
+            assert_eq!(nested.files, 1);
+            assert_eq!(
+                preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
+                snapshot.tree.bytes
+            );
         }
     }
 

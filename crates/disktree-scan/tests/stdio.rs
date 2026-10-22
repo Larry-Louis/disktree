@@ -201,7 +201,7 @@ fn assert_bounded_stream_memory(root: &std::path::Path) {
         &serde_json::json!({
             "root": root, "disk": false,
             "options": ScanOptions::default(), "watch_disconnect": true,
-            "live_progress": true, "client_dedup": true,
+            "live_progress": true, "client_dedup": true, "live_tree": true,
         }),
     )
     .unwrap();

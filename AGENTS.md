@@ -114,6 +114,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
     Switching machines clears marks and identity. The Unix SSH helper streams
     records and never retains the tree.
 
+11. **A live overview is not an actionable tree.** Keep provisional,
+    bounded display summaries separate from `Disktree::tree` and all path,
+    mark and removal APIs. Only a complete scan may replace the real tree.
+    Counters and sampled paths belong in fixed, monospace progress lanes.
+
 ## Where changes belong
 
 | change | where |
