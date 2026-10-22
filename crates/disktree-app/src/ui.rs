@@ -96,6 +96,9 @@ pub mod size {
     pub const SIZE_LANE: Rems = Rems(5.0);
     /// The cursor tooltip.
     pub const TOOLTIP: Rems = Rems(16.75);
+    /// Source/root chooser, with room for host, path and mount labels.
+    pub const SOURCE_PICKER: Rems = Rems(40.0);
+    pub const SOURCE_LIST_HEIGHT: Rems = Rems(18.0);
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
     /// The key column of the keyboard overlay.

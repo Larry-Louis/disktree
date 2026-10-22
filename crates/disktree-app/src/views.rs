@@ -12,8 +12,8 @@ use disktree_core::tree::Metric;
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
-    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement,
+    KeyDownEvent, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
@@ -43,6 +43,10 @@ pub fn root(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Stateful<Div> {
+    if app.volumes_open {
+        app.prepare_picker_inputs(window, cx);
+    }
+    app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
     let body = match app.screen {
         Screen::Explore => explore(app, window, cx),
@@ -93,6 +97,11 @@ pub fn root(
                 cx.notify();
                 return;
             }
+            if this.volumes_open {
+                let editing = [&this.picker_host, &this.picker_path].into_iter()
+                    .flatten().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+                if editing && event.keystroke.key != "escape" { return; }
+            }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
         }))
@@ -112,7 +121,7 @@ pub fn root(
         root = root.child(help_overlay(app, cx));
     }
     if app.volumes_open {
-        root = root.child(volumes_dialog(app, cx));
+        root = root.child(volumes_dialog(app, window, cx));
     }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
@@ -124,38 +133,47 @@ pub fn root(
 /// volume with its free space, and the choice is the new root.
 fn volumes_dialog(
     app: &Disktree,
+    window: &Window,
     cx: &mut Context<'_, Disktree>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let cancel = cx.entity().downgrade();
+    let source = app.volumes_source.as_ref().map_or_else(
+        || "This computer".to_owned(),
+        |host| format!("{host} · SSH · read-only"),
+    );
     let mut rows = div()
         .id("volume-rows")
         .debug_selector(|| "volume-rows".into())
         .flex()
         .flex_col()
-        .gap(space::XS);
+        .gap(space::XS)
+        .max_h(size::SOURCE_LIST_HEIGHT)
+        .overflow_y_scroll();
     if app.volumes_loading {
-        rows = rows.child(dialog_description("Looking for volumes…", cx));
+        rows = rows.child(dialog_description(
+            "Listing mounts, not scanning files…",
+            cx,
+        ));
+    } else if let Some(error) = &app.volumes_error {
+        rows = rows.child(div().text_color(theme.danger).child(error.clone()));
     } else if app.volumes.is_empty() {
-        rows = rows
-            .child(dialog_description("No other volume could be read.", cx));
+        rows = rows.child(dialog_description(
+            "No mounts listed. Enter a directory below.",
+            cx,
+        ));
     }
     for (index, volume) in app.volumes.iter().enumerate() {
         let highlighted = index == app.volume_highlight;
-        let free = volume.space.map_or_else(
-            || "unknown free".to_string(),
-            |space| format!("{} free", human_bytes(space.available)),
+        let label = format!(
+            "{}  ·  {}",
+            volume.point.display(),
+            volume.device.as_deref().unwrap_or("Mounted volume")
         );
-        let label = match &volume.device {
-            Some(device) => format!(
-                "{}  \u{00b7}  {device}  \u{00b7}  {free}",
-                volume.point.display()
-            ),
-            None => format!("{}  \u{00b7}  {free}", volume.point.display()),
-        };
         rows = rows.child(
             div()
                 .id(ElementId::Name(format!("volume-{index}").into()))
+                .debug_selector(move || format!("volume-{index}"))
                 .px(space::MD)
                 .py(space::SM)
                 .text_size(text::BODY)
@@ -164,25 +182,57 @@ fn volumes_dialog(
                 } else {
                     theme.foreground
                 })
-                // Only the row the keys are on is tinted: a second highlight
-                // would read as a second selection.
                 .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
                 .hover(|row| row.bg(theme.accent.opacity(0.1)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.volume_highlight = index;
-                    this.choose_volume(cx);
-                    window.focus(&this.focus, cx);
+                    window.focus(&this.confirm_focus, cx);
+                    cx.notify();
                 })),
         );
     }
-    let popup = dialog_popup(cx)
-        .child(dialog_title("Scan a volume", cx))
+    let host = app
+        .picker_host
+        .as_ref()
+        .expect("picker prepared before rendering");
+    let path = app
+        .picker_path
+        .as_ref()
+        .expect("picker prepared before rendering");
+    let popup = dialog_popup(cx).w(size::SOURCE_PICKER)
+        .child(dialog_title("Choose what to scan", cx))
         .child(dialog_description(
-            "Up and down moves, Enter scans it, Escape stays here.",
-            cx,
-        ))
-        .child(rows);
+            "Connect, then select a mount or directory. Nothing is scanned until you choose Scan.",
+            cx))
+        .child(div().flex().flex_row().gap(space::SM)
+            .child(button("source-local", "This computer", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.load_volume_source(None, cx))))
+            .child(gpui_omarchy::input("source-host", host, window, cx)
+                .debug_selector(|| "source-host".into()).flex_1())
+            .child(button("source-connect", "Connect SSH", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.connect_picker(cx)))))
+        .child(div().text_color(theme.bright).child(source))
+        .child(rows)
+        .child(dialog_description(
+            "Nested mounts and symlinks are not traversed. Space is measured only after selection.", cx))
+        .child(div().flex().flex_row().gap(space::SM)
+            .child(gpui_omarchy::input("source-path", path, window, cx)
+                .debug_selector(|| "source-path".into()).flex_1())
+            .child(button("source-scan-path", "Scan directory", ButtonVariant::Secondary, cx)
+                .disabled(app.volumes_loading || app.volumes_error.is_some())
+                .on_click(cx.listener(|this, _, _, cx| this.choose_picker_path(cx)))))
+        .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(error.clone())))
+        .child(div().flex().flex_row().justify_end().gap(space::SM)
+            .child(dialog_button("source-cancel", "Cancel", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_volumes(cx); this.apply_focus(window, cx);
+                })))
+            .child(dialog_button("source-scan", "Scan selected mount", ButtonVariant::Primary, cx)
+                .disabled(app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.choose_volume(cx); this.apply_focus(window, cx);
+                }))));
     let centred = centred_popup(popup, {
         let close = cancel.clone();
         move |_, window, cx| {
@@ -197,7 +247,23 @@ fn volumes_dialog(
         .open(true)
         .on_ok(move |_, window, cx| {
             let _ = accept.update(cx, |this, cx| {
-                this.choose_volume(cx);
+                let host_focused =
+                    this.picker_host.as_ref().is_some_and(|input| {
+                        input.read(cx).focus_handle(cx).is_focused(window)
+                    });
+                let path_focused =
+                    this.picker_path.as_ref().is_some_and(|input| {
+                        input.read(cx).focus_handle(cx).is_focused(window)
+                    });
+                if this.volumes_open {
+                    if host_focused {
+                        this.connect_picker(cx);
+                    } else if path_focused {
+                        this.choose_picker_path(cx);
+                    } else {
+                        this.choose_volume(cx);
+                    }
+                }
                 this.apply_focus(window, cx);
             });
             false
@@ -342,6 +408,39 @@ fn explore(
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
     let theme = cx.omarchy().clone();
+    if app.awaiting_root {
+        return div()
+            .debug_selector(|| "choose-root-idle".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(space::LG)
+            .p(space::XXL)
+            .child(
+                div()
+                    .text_size(text::HEADING)
+                    .child("Choose a source. Then choose a root."),
+            )
+            .child(div().text_color(theme.secondary).child(
+                "Local or SSH · one mount at a time · no background scan",
+            ))
+            .child(
+                button(
+                    "choose-source",
+                    "Choose source…",
+                    ButtonVariant::Primary,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.open_volumes(cx);
+                        this.apply_focus(window, cx);
+                    },
+                )),
+            );
+    }
     let mosaic: Mosaic = app.prepare();
     let width_rems = window.viewport_size().width.as_f32() / app.rem;
     // The panel is where the selection, the marks and the disk live; it
@@ -460,7 +559,14 @@ fn top_bar(
         .py(space::MD)
         .border_b_1()
         .border_color(theme.divider())
-        .child(logo(theme))
+        .child(with_tooltip(
+            logo(theme).id("choose-source").cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_volumes(cx);
+                    this.apply_focus(window, cx);
+                })),
+            "Choose local or SSH source · v",
+        ))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
         .child(div().flex_1())
@@ -2031,7 +2137,7 @@ fn disk_section(
         )
         .child(div().flex_1())
         .child(
-            button("volumes", "Volumes", ButtonVariant::Secondary, cx)
+            button("volumes", "Source…", ButtonVariant::Secondary, cx)
                 .tab_stop(false)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_volumes(cx);

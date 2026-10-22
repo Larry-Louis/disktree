@@ -93,6 +93,120 @@ fn read<R>(
 }
 
 #[gpui_kit::test]
+fn startup_chooser_never_scans_before_explicit_acceptance(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(cx.debug_bounds("choose-root-idle").is_some());
+    assert!(cx.debug_bounds("source-host").is_some());
+    read(&view, cx, |app| {
+        assert!(app.awaiting_root);
+        assert_eq!(app.scan_epoch, 0);
+        assert!(app.scan.is_none() && app.remote_scan.is_none());
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    press(cx, "r");
+    assert!(read(&view, cx, |app| app.volumes_open
+        && app.awaiting_root
+        && app.scan.is_none()));
+}
+
+#[gpui_kit::test]
+fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let selected = fixture();
+    let other = fixture();
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    update(&view, cx, |app, _| {
+        app.volumes = vec![Volume {
+            point: other.path().into(),
+            device: None,
+            space: None,
+        }];
+        app.volumes_loading = false;
+    });
+    draw(cx);
+    let input = cx.debug_bounds("source-path").expect("path editor");
+    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
+    cx.simulate_input(selected.path().to_str().unwrap());
+    assert_eq!(
+        update(&view, cx, |app, cx| app
+            .picker_path
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .value()
+            .to_string()),
+        selected.path().to_str().unwrap()
+    );
+    press(cx, "enter");
+    assert_eq!(
+        read(&view, cx, |app| app.root_path.clone()),
+        dunce::canonicalize(selected.path()).unwrap()
+    );
+    assert!(!read(&view, cx, |app| app.awaiting_root || app.volumes_open));
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
+fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    draw(cx);
+    let input = cx.debug_bounds("source-host").expect("host editor");
+    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
+    cx.simulate_input("invalid host");
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert!(app.volumes_error.is_some());
+        assert!(app.remote.is_none());
+        assert!(app.scan.is_none() && app.remote_scan.is_none());
+        assert_eq!(app.scan_epoch, 0);
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+}
+
+#[gpui_kit::test]
+fn switching_from_remote_to_local_clears_machine_specific_marks(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let target = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.remote = Some("old-source".into());
+        app.remote_identity = Some(disktree_core::identity::HostIdentity {
+            hostname: "old-source".into(),
+            machine_id: None,
+        });
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        assert!(!app.marks.is_empty());
+        app.volumes_open = true;
+        app.volumes_source = None;
+        app.choose_source_root(target.path().to_path_buf(), cx);
+        assert!(app.remote.is_none() && app.remote_identity.is_none());
+        assert!(app.marks.is_empty());
+        assert!(app.tree.is_none());
+    });
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
 fn remote_review_never_deletes_even_through_direct_actions(
     cx: &mut TestAppContext,
 ) {

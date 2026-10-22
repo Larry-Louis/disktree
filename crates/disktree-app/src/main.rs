@@ -45,6 +45,7 @@ struct Args {
     remote: Option<String>,
     remote_disk: bool,
     check: bool,
+    choose_root: bool,
     options: ScanOptions,
     depth: u32,
     power: Option<power::PowerEfficiency>,
@@ -225,14 +226,23 @@ fn run() -> Result<()> {
                             appearance::follow(window);
                         }
                         cx.new(|cx| {
-                            let mut app = Disktree::open(
-                                root_for_app.clone(),
-                                options.clone(),
-                                depth,
-                                args.remote.clone(),
-                                args.remote_disk,
-                                cx,
-                            );
+                            let mut app = if args.choose_root {
+                                Disktree::choose(
+                                    options.clone(),
+                                    depth,
+                                    args.remote.clone(),
+                                    cx,
+                                )
+                            } else {
+                                Disktree::open(
+                                    root_for_app.clone(),
+                                    options.clone(),
+                                    depth,
+                                    args.remote.clone(),
+                                    args.remote_disk,
+                                    cx,
+                                )
+                            };
                             app.power_choice = args.power;
                             app
                         })
@@ -424,12 +434,14 @@ fn parse_args_with_power(
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
+    let choose_root = root.is_none() && !disk && !check;
     if remote.is_some() {
         return Ok(Args {
             root: root.unwrap_or_default(),
             remote,
             remote_disk: disk,
             check,
+            choose_root,
             power,
             options,
             depth,
@@ -442,23 +454,33 @@ fn parse_args_with_power(
             .and_then(disktree_core::space::volume_root_for)
             .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
-        None => home.context("no path given and no home directory")?,
+        None => home.unwrap_or_default(),
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
     // Canonical, so a later widening recognises this tree in the wider walk;
     // through dunce, so Windows gets `C:\Users\…` rather than the `\\?\C:\…`
     // form nothing else is written in.
-    let root = dunce::canonicalize(&root).unwrap_or(root);
-    let metadata = std::fs::metadata(&root)
-        .with_context(|| format!("cannot read {}", root.display()))?;
-    anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
+    let root = if choose_root {
+        root
+    } else {
+        let root = dunce::canonicalize(&root).unwrap_or(root);
+        let metadata = std::fs::metadata(&root)
+            .with_context(|| format!("cannot read {}", root.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "{} is not a directory",
+            root.display()
+        );
+        root
+    };
 
     Ok(Args {
         root,
         remote: None,
         remote_disk: false,
         check,
+        choose_root,
         options,
         depth: depth.clamp(1, 6),
         power,
@@ -534,6 +556,19 @@ mod argument_tests {
                 < f64::EPSILON
         );
         assert_eq!(args.options.threads.system_cpu_limit, None);
+    }
+
+    #[test]
+    fn no_implicit_root_requires_selection_but_explicit_scans_do_not() {
+        let parse = |args: &[&str]| {
+            parse_args(args.iter().map(std::ffi::OsString::from)).unwrap()
+        };
+        assert!(parse(&[]).choose_root);
+        assert!(parse(&["ssh", "dev"]).choose_root);
+        assert!(!parse(&["."]).choose_root);
+        assert!(!parse(&["--disk"]).choose_root);
+        assert!(!parse(&["ssh", "dev", "/only-on-server"]).choose_root);
+        assert!(!parse(&["ssh", "dev", "--check"]).choose_root);
     }
 
     #[test]
