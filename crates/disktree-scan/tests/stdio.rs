@@ -201,3 +201,17 @@ fn wide_stream_has_bounded_resident_memory() {
     assert!(helper.0.wait().unwrap().success());
     drop(input);
 }
+
+#[test]
+fn executable_discovers_roots_without_scanning_a_path() {
+    let mut helper = supervised_helper();
+    let mut input = helper.0.stdin.take().unwrap();
+    input.write_all(b"{\"discover_version\":1,\"watch_disconnect\":true,\"root\":\"/missing-disktree-discovery-root\"}\n").unwrap();
+    let roots = disktree_core::remote::read_roots(&mut BufReader::new(
+        helper.0.stdout.take().unwrap(),
+    ))
+    .unwrap();
+    assert!(roots.volumes.iter().all(|volume| volume.space.is_none()));
+    assert!(helper.0.wait().unwrap().success());
+    drop(input);
+}

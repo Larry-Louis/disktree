@@ -42,12 +42,45 @@ pub struct Request {
 
 // Old helpers ignore this extra field. Old clients may still half-close
 // stdin; only clients opting in promise to keep it open during the scan.
-#[derive(Serialize, Deserialize)]
-struct SessionRequest {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Operation {
+    // No scan fields: legacy helpers reject discovery before any traversal,
+    // instead of silently ignoring an unfamiliar operation and scanning ~.
+    Discover { discover_version: u32 },
+    Scan(Request),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionRequest {
     #[serde(flatten)]
-    request: Request,
+    pub operation: Operation,
     #[serde(default)]
-    watch_disconnect: bool,
+    pub watch_disconnect: bool,
+}
+
+/// The target's root candidates, without walking or probing any of them.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Roots {
+    version: u32,
+    pub home: Option<PathBuf>,
+    pub platform: String,
+    pub identity: Option<crate::identity::HostIdentity>,
+    pub volumes: Vec<crate::space::Volume>,
+}
+
+pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
+    let roots: Roots = receive(input)?;
+    if roots.version != VERSION
+        || roots
+            .volumes
+            .iter()
+            .any(|volume| !volume.point.is_absolute())
+        || roots.home.as_ref().is_some_and(|home| !home.is_absolute())
+    {
+        return Err(io::Error::other("incompatible remote root discovery"));
+    }
+    Ok(roots)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,17 +150,42 @@ fn receive<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&line).map_err(json_error)
 }
 
-/// The helper has exactly one operation: scan. It never removes files,
-/// installs software, invokes sudo, or executes a command from the client.
+/// Only read-only discovery and scans: no command execution or removal.
 pub fn serve(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<()> {
-    let (request, _) = read_request(input)?;
-    serve_request(request, out)
+    serve_session(read_request(input)?, out)
 }
 
 /// Read one bounded request, including the opt-in connection lifetime.
-pub fn read_request(input: &mut impl BufRead) -> io::Result<(Request, bool)> {
-    let session: SessionRequest = receive(input)?;
-    Ok((session.request, session.watch_disconnect))
+pub fn read_request(input: &mut impl BufRead) -> io::Result<SessionRequest> {
+    receive(input)
+}
+
+/// Dispatch without resolving any scan path until a scan was requested.
+pub fn serve_session(
+    session: SessionRequest,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match session.operation {
+        Operation::Scan(request) => serve_request(request, out),
+        Operation::Discover { discover_version } => {
+            if discover_version != VERSION {
+                return Err(io::Error::other(
+                    "unsupported root discovery version",
+                ));
+            }
+            send(
+                out,
+                &Roots {
+                    version: VERSION,
+                    home: std::env::home_dir(),
+                    platform: std::env::consts::OS.into(),
+                    identity: crate::identity::HostIdentity::current(),
+                    volumes: crate::space::volume_roots()?,
+                },
+            )?;
+            out.flush()
+        }
+    }
 }
 
 /// Scan a decoded request. The standalone helper supervises its lifetime.
@@ -322,34 +380,44 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
 /// The helper monitors stdin for EOF even before it has a tree to write;
 /// keep the request pipe open until the entire snapshot has arrived.
 #[derive(Debug)]
-pub struct RemoteScan {
+pub struct RemoteJob<T> {
     child: Arc<Mutex<Child>>,
-    result: mpsc::Receiver<io::Result<Snapshot>>,
+    result: mpsc::Receiver<io::Result<T>>,
+}
+
+pub type RemoteScan = RemoteJob<Snapshot>;
+pub type RemoteRoots = RemoteJob<Roots>;
+
+fn ssh_command(
+    host: &str,
+) -> io::Result<(Command, Option<crate::payload::Archive>)> {
+    validate_host(host)?;
+    let archive = crate::payload::Archive::current()?;
+    let remote = if archive.is_some() {
+        crate::deployment::COMMAND
+    } else {
+        REMOTE_COMMAND
+    };
+    let mut command = Command::new("ssh");
+    command.args([
+        "-T",
+        "-C",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
+        "--",
+        host,
+        remote,
+    ]);
+    Ok((command, archive))
 }
 
 impl RemoteScan {
     pub fn spawn(host: &str, request: &Request) -> io::Result<Self> {
-        validate_host(host)?;
-        let archive = crate::payload::Archive::current()?;
-        let remote = if archive.is_some() {
-            crate::deployment::COMMAND
-        } else {
-            REMOTE_COMMAND
-        };
-        let mut command = Command::new("ssh");
-        command.args([
-            "-T",
-            "-C",
-            "-o",
-            "ConnectTimeout=15",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=2",
-            "--",
-            host,
-            remote,
-        ]);
+        let (command, archive) = ssh_command(host)?;
         Self::spawn_with_archive(command, host, request, archive)
     }
 
@@ -363,10 +431,54 @@ impl RemoteScan {
     }
 
     fn spawn_with_archive(
-        mut command: Command,
+        command: Command,
         host: &str,
         request: &Request,
         archive: Option<crate::payload::Archive>,
+    ) -> io::Result<Self> {
+        let metric = request.options.metric;
+        Self::start(
+            command,
+            host,
+            Operation::Scan(request.clone()),
+            archive,
+            move |input| {
+                let mut snapshot = read_snapshot(input)?;
+                if metric != crate::tree::Metric::Bytes {
+                    aggregate(&mut snapshot.tree, metric);
+                }
+                Ok(snapshot)
+            },
+        )
+    }
+}
+
+impl RemoteRoots {
+    pub fn discover(host: &str) -> io::Result<Self> {
+        let (command, archive) = ssh_command(host)?;
+        Self::start(
+            command,
+            host,
+            Operation::Discover {
+                discover_version: VERSION,
+            },
+            archive,
+            read_roots,
+        )
+    }
+}
+
+impl<T: Send + 'static> RemoteJob<T> {
+    fn start(
+        mut command: Command,
+        host: &str,
+        operation: Operation,
+        archive: Option<crate::payload::Archive>,
+        decode: impl FnOnce(
+            &mut BufReader<std::process::ChildStdout>,
+        ) -> io::Result<T>
+        + Send
+        + 'static,
     ) -> io::Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
@@ -374,20 +486,17 @@ impl RemoteScan {
             .stderr(Stdio::piped())
             .spawn()?;
         let stderr = child.stderr.take().expect("piped stderr");
-        // Drain concurrently: a noisy login script must not fill SSH's stderr
-        // pipe and deadlock a scan. Retain only a bounded tail for the window.
+        // Drain concurrently so noisy login scripts cannot block discovery.
         let diagnostics = std::thread::spawn(move || read_diagnostics(stderr));
         let mut stdin = child.stdin.take().expect("piped stdin");
-        let request = request.clone();
         let stdout = child.stdout.take().expect("piped stdout");
         let child = Arc::new(Mutex::new(child));
         let worker = child.clone();
-        let metric = request.options.metric;
         let host = host.to_owned();
         let (tx, result) = mpsc::channel();
         std::thread::spawn(move || {
             let mut input = BufReader::new(stdout);
-            let snapshot = (|| {
+            let response = (|| {
                 if let Some(archive) = archive {
                     crate::deployment::deploy(
                         &archive, &mut input, &mut stdin,
@@ -396,28 +505,31 @@ impl RemoteScan {
                 send(
                     &mut stdin,
                     &SessionRequest {
-                        request,
+                        operation,
                         watch_disconnect: true,
                     },
                 )?;
-                read_snapshot(&mut input)
-            })()
-            .map(|mut snapshot| {
-                if metric != crate::tree::Metric::Bytes {
-                    aggregate(&mut snapshot.tree, metric);
-                }
-                snapshot
-            });
+                decode(&mut input)
+            })();
             drop(stdin);
-            let mut process = worker.lock().expect("SSH process lock");
-            if snapshot.is_err() {
-                let _ = process.kill();
+            if response.is_err() {
+                let _ = worker.lock().expect("SSH process lock").kill();
             }
-            let status = process.wait();
-            drop(process);
+            // Never hold the process lock across wait(): cancellation must
+            // be able to acquire it even after a response was read.
+            let status = loop {
+                let status =
+                    worker.lock().expect("SSH process lock").try_wait();
+                match status {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => {}
+                    Err(error) => break Err(error),
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(10));
+            };
             let details = diagnostics.join().unwrap_or_default();
-            let outcome = match (snapshot, status) {
-                (Ok(snapshot), Ok(status)) if status.success() => Ok(snapshot),
+            let outcome = match (response, status) {
+                (Ok(response), Ok(status)) if status.success() => Ok(response),
                 (Err(error), _) | (_, Err(error)) => {
                     Err(ssh_error(&host, &details, &error))
                 }
@@ -432,12 +544,12 @@ impl RemoteScan {
         Ok(Self { child, result })
     }
 
-    pub fn poll(&self) -> Option<io::Result<Snapshot>> {
+    pub fn poll(&self) -> Option<io::Result<T>> {
         self.result.try_recv().ok()
     }
 }
 
-impl Drop for RemoteScan {
+impl<T> Drop for RemoteJob<T> {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
@@ -457,14 +569,14 @@ mod tests {
         }
     }
 
-    fn wait(scan: &RemoteScan) -> io::Result<Snapshot> {
+    fn wait<T: Send + 'static>(scan: &RemoteJob<T>) -> io::Result<T> {
         wait_for(scan, std::time::Duration::from_secs(10))
     }
 
-    fn wait_for(
-        scan: &RemoteScan,
+    fn wait_for<T: Send + 'static>(
+        scan: &RemoteJob<T>,
         timeout: std::time::Duration,
-    ) -> io::Result<Snapshot> {
+    ) -> io::Result<T> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(result) = scan.poll() {
@@ -518,6 +630,55 @@ mod tests {
                 failing_process(&format!("read -r request; printf '{output}'"))
                     .to_string();
             assert!(error.contains("SSH dev:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn discovery_is_not_a_legacy_scan_request() {
+        let session = SessionRequest {
+            operation: Operation::Discover {
+                discover_version: VERSION,
+            },
+            watch_disconnect: true,
+        };
+        let bytes = serde_json::to_vec(&session).unwrap();
+        assert!(serde_json::from_slice::<Request>(&bytes).is_err());
+        let mut input = bytes;
+        input.push(b'\n');
+        let mut output = Vec::new();
+        serve(&mut input.as_slice(), &mut output).unwrap();
+        let roots = read_roots(&mut output.as_slice()).unwrap();
+        assert!(roots.volumes.iter().all(|volume| volume.space.is_none()));
+        assert!(!roots.platform.is_empty());
+        assert!(roots.identity.is_some());
+    }
+
+    #[test]
+    fn discovery_never_resolves_a_scan_path_and_rejects_unknown_versions() {
+        let mut output = Vec::new();
+        // No scan fields: an old helper fails to decode this, rather than
+        // falling back to its default home-directory walk.
+        serve(&mut b"{\"discover_version\":1,\"root\":\"/does-not-exist-disktree-test\"}\n".as_slice(),
+            &mut output).unwrap();
+        assert!(read_roots(&mut output.as_slice()).is_ok());
+        assert!(
+            serve(
+                &mut b"{\"discover_version\":99}\n".as_slice(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_discovery_records_are_not_accepted_as_roots() {
+        for value in [
+            serde_json::json!({"version":99,"home":null,"platform":"linux","identity":null,"volumes":[]}),
+            serde_json::json!({"version":1,"home":null,"platform":"linux","identity":null,"volumes":[{"point":"relative","device":null,"space":null}]}),
+        ] {
+            let mut data = serde_json::to_vec(&value).unwrap();
+            data.push(b'\n');
+            assert!(read_roots(&mut data.as_slice()).is_err());
         }
     }
 
@@ -660,6 +821,52 @@ mod tests {
             }
         }
         assert!(!home.path().join(".local/bin/disktree-scan").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires isolated sshd and DISKTREE_TEST_ARCHIVE"]
+    fn real_ssh_transport_discovers_roots_without_a_scan() {
+        let config = std::env::var("DISKTREE_TEST_SSH_CONFIG").unwrap();
+        let archive = crate::payload::Archive::open(
+            PathBuf::from(std::env::var("DISKTREE_TEST_ARCHIVE").unwrap())
+                .as_path(),
+        )
+        .unwrap()
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("cache");
+        let remote = format!(
+            "HOME={} XDG_CACHE_HOME={}; export HOME XDG_CACHE_HOME;\n{}",
+            crate::export::shell_quote(home.path().to_str().unwrap()),
+            crate::export::shell_quote(cache.to_str().unwrap()),
+            crate::deployment::COMMAND,
+        );
+        let mut command = Command::new("ssh");
+        command.args(["-F", &config, "-T", "fixture", &remote]);
+        let job = RemoteRoots::start(
+            command,
+            "fixture",
+            Operation::Discover {
+                discover_version: VERSION,
+            },
+            Some(archive),
+            read_roots,
+        )
+        .unwrap();
+        let roots = wait(&job).unwrap();
+        assert_eq!(roots.home.as_deref(), Some(home.path()));
+        assert!(roots.identity.is_some());
+        assert!(
+            roots
+                .volumes
+                .iter()
+                .all(|volume| volume.point.is_absolute()
+                    && volume.space.is_none())
+        );
+        // Only the checked cache was installed, not a per-root scan log,
+        // helper in PATH, or a traversed home tree.
+        assert!(!home.path().join(".local").exists());
     }
 
     /// Explicit opt-in only: never contact a real machine in the test gate.

@@ -202,6 +202,12 @@ terminal, it can ask for a password or key passphrase there; GUI launches
 need key/agent access or a working SSH askpass helper. Connect once with
 `ssh dev` to verify access and accept its host key.
 
+The protocol also supports lightweight root discovery, separate from a scan:
+it reads the target's mount namespace without walking or probing the listed
+paths. Same-device mounts remain distinct choices; capacity is unknown
+until a root is explicitly selected. Discovery requests omit scan fields,
+so outdated helpers reject them instead of silently scanning their home.
+
 The Linux/macOS helper streams a depth-first walk directly to stdout. It
 never constructs a tree or retains a directory's children: memory scales
 with open ancestors (at most 256), not file count. Only pending hardlink

@@ -738,7 +738,7 @@ pub const fn foreign_mounts_for(_root: &Path) -> Option<Vec<PathBuf>> {
 
 /// A mounted volume the picker can switch the scan to: where it is mounted
 /// and how much room it has. Listed by [`volumes`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Volume {
     /// Where the volume is mounted: `C:\` on Windows, `/` or `/home` on
     /// Linux, `/` on macOS.
@@ -765,8 +765,46 @@ pub fn volumes() -> Vec<Volume> {
     volumes_in(&parse_mounts(&table))
 }
 
-/// [`volumes`] over a given mount table, for testing.
-pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
+/// Read root candidates without opening them, measuring free space, or
+/// touching network mounts. Discovery is not permission to start scanning.
+pub fn volume_roots() -> io::Result<Vec<Volume>> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let mounts = mount_table()
+            .ok_or_else(|| io::Error::other("cannot read mount table"))?;
+        Ok(volume_roots_in(&mounts))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("mount").output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("cannot list mounted volumes"));
+        }
+        Ok(parse_macos_mounts(&String::from_utf8_lossy(&output.stdout))
+            .into_iter()
+            .filter(|point| point.as_os_str() != MACOS_DATA_VOLUME)
+            .map(|point| Volume {
+                point,
+                device: None,
+                space: None,
+            })
+            .collect())
+    }
+    #[cfg(windows)]
+    {
+        Ok(crate::windows::mount_points()
+            .into_iter()
+            .map(|point| Volume {
+                point,
+                device: None,
+                space: None,
+            })
+            .collect())
+    }
+}
+
+/// Root candidates from a mount table; deliberately never calls statvfs.
+pub fn volume_roots_in(mounts: &[Mount]) -> Vec<Volume> {
     let mut seen: Vec<&Mount> = Vec::new();
     for mount in mounts {
         if !is_volume_candidate(mount) {
@@ -784,11 +822,19 @@ pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
         .map(|mount| Volume {
             point: mount.point.clone(),
             device: Some(mount.source.clone()),
-            space: space_info(&mount.point).ok(),
+            space: None,
         })
         .collect();
-    // The scarcest room is the most interesting to a cleanup tool, so the
-    // fullest volume that still reads is first; unreadable ones sort last.
+    volumes.sort_by(|left, right| left.point.cmp(&right.point));
+    volumes
+}
+
+/// [`volumes`] over a given mount table, for testing.
+pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
+    let mut volumes = volume_roots_in(mounts);
+    for volume in &mut volumes {
+        volume.space = space_info(&volume.point).ok();
+    }
     sort_by_free_space(&mut volumes);
     volumes
 }
@@ -1058,6 +1104,23 @@ portal /run/user/1000/doc fuse.portal rw 0 0
         assert_eq!(
             names,
             ["full", "nearly-full", "roomy", "unknown"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn discovery_candidates_do_not_probe_unavailable_mounts() {
+        let table = parse_mounts(
+            "/dev/root /not-present-disktree-root ext4 rw 0 0\n\
+             /dev/root /not-present-disktree-bind ext4 rw 0 0\n\
+             server:/share /unreachable-disktree-network nfs rw 0 0\n\
+             systemd-1 /untriggered-disktree-autofs autofs rw 0 0\n",
+        );
+        let volumes = volume_roots_in(&table);
+        assert_eq!(volumes.len(), 3);
+        assert!(volumes.iter().all(|volume| volume.space.is_none()));
+        assert!(
+            !volumes.iter().any(|volume| volume.point
+                == Path::new("/untriggered-disktree-autofs"))
         );
     }
 

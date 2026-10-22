@@ -18,9 +18,8 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             })?;
         let mut input = BufReader::new(io::stdin());
-        let (request, watch_disconnect) =
-            disktree_core::remote::read_request(&mut input)?;
-        if watch_disconnect {
+        let session = disktree_core::remote::read_request(&mut input)?;
+        if session.watch_disconnect {
             std::thread::Builder::new()
                 .name("scan-connection".into())
                 .spawn(move || {
@@ -41,8 +40,8 @@ fn main() -> io::Result<()> {
                     }
                 })?;
         }
-        disktree_core::remote::serve_request(
-            request,
+        disktree_core::remote::serve_session(
+            session,
             &mut BufWriter::new(io::stdout().lock()),
         )
     } else if args.is_empty() || args == ["--help"] || args == ["-h"] {
