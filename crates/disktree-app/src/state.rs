@@ -325,6 +325,11 @@ pub struct RunSummary {
 pub struct Disktree {
     /// The directory the tree was scanned from.
     pub root_path: PathBuf,
+    pub remote: Option<String>,
+    remote_disk: bool,
+    pub remote_scan: Option<disktree_core::remote::RemoteScan>,
+    remote_platform: String,
+    pub remote_identity: Option<disktree_core::identity::HostIdentity>,
     pub home: Option<PathBuf>,
     pub options: ScanOptions,
     pub power_choice: Option<crate::power::PowerEfficiency>,
@@ -458,17 +463,39 @@ pub struct Disktree {
 }
 
 impl Disktree {
+    #[cfg(test)]
     pub fn new(
         root_path: PathBuf,
         options: ScanOptions,
         depth: u32,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let home = std::env::home_dir();
-        let space = space_info(&root_path).ok();
+        Self::open(root_path, options, depth, None, false, cx)
+    }
+
+    pub fn open(
+        root_path: PathBuf,
+        options: ScanOptions,
+        depth: u32,
+        remote: Option<String>,
+        remote_disk: bool,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let local = remote.is_none();
+        let home = if local { std::env::home_dir() } else { None };
+        let space = if local {
+            space_info(&root_path).ok()
+        } else {
+            None
+        };
         let trash_backend = detect_trash_backend();
         let mut tree = Self {
             root_path,
+            remote,
+            remote_disk,
+            remote_scan: None,
+            remote_platform: String::new(),
+            remote_identity: None,
             home,
             options,
             power_choice: None,
@@ -552,18 +579,22 @@ impl Disktree {
             scan_elapsed: None,
             scanned_at: now_seconds(),
         };
-        tree.device = device_for(&tree.root_path);
-        tree.full_disk_access = tree
-            .home
-            .as_deref()
-            .and_then(disktree_core::access::full_disk_access);
-        // The disk of what is on screen, as `set_root` keeps it: `disktree
-        // /Volumes/Ext` then `g` measures that drive, like opening it with ⌘O.
-        tree.disk_root = volume_root_for(&tree.root_path);
-        tree.file_table = file_table_readable(&tree.root_path);
-        disktree_core::removal::prime_mount_points();
+        if local {
+            tree.device = device_for(&tree.root_path);
+            tree.full_disk_access = tree
+                .home
+                .as_deref()
+                .and_then(disktree_core::access::full_disk_access);
+            // The disk of what is on screen, as `set_root` keeps it: `disktree
+            // /Volumes/Ext` then `g` measures that drive, like opening it with ⌘O.
+            tree.disk_root = volume_root_for(&tree.root_path);
+            tree.file_table = file_table_readable(&tree.root_path);
+            disktree_core::removal::prime_mount_points();
+        }
         tree.start_scan(cx);
-        Self::start_space_ticker(cx);
+        if local {
+            Self::start_space_ticker(cx);
+        }
         tree
     }
 
@@ -597,6 +628,12 @@ impl Disktree {
     /// Scan a different root from scratch. Marks are kept; a mark outside
     /// the new root is shown as kept back, never removed.
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<'_, Self>) {
+        if self.remote.is_some() {
+            self.root_path = root;
+            self.remote_disk = false;
+            self.start_scan(cx);
+            return;
+        }
         self.space = space_info(&root).ok();
         self.device = device_for(&root);
         // "Whole disk" means the disk of what is on screen, which a new root
@@ -615,6 +652,10 @@ impl Disktree {
     /// where it is reached, so only what is new at the wider level is read,
     /// and the current view stays on screen until the wider tree lands.
     pub fn widen_to(&mut self, above: PathBuf, cx: &mut Context<'_, Self>) {
+        if self.remote.is_some() {
+            self.set_root(above, cx);
+            return;
+        }
         let Some(tree) = self.tree.clone() else {
             self.set_root(above, cx);
             return;
@@ -650,6 +691,9 @@ impl Disktree {
     /// is left alone until a volume is picked; picking calls [`set_root`],
     /// which cancels it.
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
+        if self.remote.is_some() {
+            return;
+        }
         self.volume_epoch += 1;
         let epoch = self.volume_epoch;
         let root_path = self.root_path.clone();
@@ -761,7 +805,10 @@ impl Disktree {
 
     /// Ask git about `path` once, off the UI thread, if it is a checkout.
     pub fn ensure_git(&mut self, path: &Path, cx: &Context<'_, Self>) {
-        if self.git.contains_key(path) || self.git_pending.contains(path) {
+        if self.remote.is_some()
+            || self.git.contains_key(path)
+            || self.git_pending.contains(path)
+        {
             return;
         }
         let path = path.to_path_buf();
@@ -801,6 +848,14 @@ impl Disktree {
     /// were the whole one: a first scan leaves the panel saying it stopped,
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
+        if self.remote_scan.take().is_some() {
+            self.scan_epoch += 1;
+            self.progress.cancelled = true;
+            self.progress.finished = true;
+            self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
+            cx.notify();
+            return;
+        }
         let Some(scan) = self.scan.take() else {
             return;
         };
@@ -940,6 +995,24 @@ impl Disktree {
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
         self.scan_root.clone_from(&self.root_path);
+        self.remote_scan = None;
+        if let Some(host) = &self.remote {
+            let request = disktree_core::remote::Request {
+                root: (!self.root_path.as_os_str().is_empty())
+                    .then(|| self.root_path.clone()),
+                disk: self.remote_disk,
+                options: self.options.clone(),
+            };
+            match disktree_core::remote::RemoteScan::spawn(host, &request) {
+                Ok(scan) => {
+                    self.remote_scan = Some(scan);
+                    Self::poll_scan(epoch, cx);
+                }
+                Err(error) => self.scan_error = Some(error.to_string()),
+            }
+            cx.notify();
+            return;
+        }
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
             self.options.clone(),
@@ -974,6 +1047,42 @@ impl Disktree {
         cx: &mut Context<'_, Self>,
     ) -> bool {
         if epoch != self.scan_epoch {
+            return false;
+        }
+        if let Some(scan) = &self.remote_scan {
+            let Some(outcome) = scan.poll() else {
+                cx.notify();
+                return true;
+            };
+            match outcome {
+                Ok(snapshot) => {
+                    self.root_path = snapshot.header.root;
+                    self.home = snapshot.header.home;
+                    self.disk_root = snapshot.header.disk_root;
+                    self.space = snapshot.header.space;
+                    self.remote_platform = snapshot.header.platform;
+                    self.remote_identity = snapshot.header.identity;
+                    self.device = self.remote.as_ref().map(|host| {
+                        format!("{host} · read-only · space at scan")
+                    });
+                    let node = snapshot.tree;
+                    self.marks.refresh(
+                        &self.root_path,
+                        &node,
+                        self.options.metric,
+                    );
+                    self.tree = Some(Arc::new(node));
+                    self.refresh_insights();
+                    self.select_largest(cx);
+                    self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
+                }
+                Err(error) => {
+                    self.scan_error = Some(error.to_string());
+                }
+            }
+            self.remote_scan = None;
+            self.progress.finished = true;
+            cx.notify();
             return false;
         }
         let Some(scan) = &self.scan else {
@@ -1749,7 +1858,7 @@ impl Disktree {
         Some(Target {
             hidden: is_hidden(&path),
             path,
-            bytes: node.value(self.options.metric),
+            bytes: node.bytes,
             is_dir: node.is_dir(),
         })
     }
@@ -1767,6 +1876,25 @@ impl Disktree {
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
+        if self.remote.is_some() {
+            // Never judge remote paths against this machine's filesystem.
+            // This is an export selection, not an executable removal plan.
+            let mut selection = Plan::default();
+            selection.targets = self
+                .marks
+                .items()
+                .iter()
+                .filter(|target| {
+                    target.path != self.root_path
+                        && target.path.starts_with(&self.root_path)
+                })
+                .cloned()
+                .collect();
+            selection.root.clone_from(&self.root_path);
+            // Remote volume attribution is unknown; never infer it from
+            // this computer's mounts or project an unmeasured saving.
+            return selection;
+        }
         plan(self.marks.items(), &self.root_path)
     }
 
@@ -2111,7 +2239,7 @@ impl Disktree {
     /// The review screen's commit: move to the trash at once, or ask first for
     /// a permanent deletion, which cannot be undone.
     pub fn commit(&mut self, cx: &mut Context<'_, Self>) {
-        if self.plan().is_empty() {
+        if self.remote.is_some() || self.plan().is_empty() {
             return;
         }
         match self.removal_mode {
@@ -2182,6 +2310,9 @@ impl Disktree {
     }
 
     pub fn begin_removal(&mut self, cx: &mut Context<'_, Self>) {
+        if self.remote.is_some() {
+            return;
+        }
         let plan = self.plan();
         if plan.is_empty() {
             self.notice = Some(("nothing is marked".into(), Status::Warning));
@@ -2401,7 +2532,10 @@ impl Disktree {
 
     /// Ask for a directory and scan it: an app opened from the Dock has no
     /// command line to name one.
-    pub fn open_folder(cx: &Context<'_, Self>) {
+    pub fn open_folder(&self, cx: &Context<'_, Self>) {
+        if self.remote.is_some() {
+            return;
+        }
         let chosen = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
             files: false,
             directories: true,
@@ -2432,18 +2566,34 @@ impl Disktree {
     /// Save what the plan would act on as a list of paths, one per line,
     /// wherever the user chooses: for a script, or for later.
     pub fn save_delete_list(&mut self, cx: &mut Context<'_, Self>) {
+        self.save_export(false, cx);
+    }
+
+    pub fn save_delete_script(&mut self, cx: &mut Context<'_, Self>) {
+        self.save_export(true, cx);
+    }
+
+    fn save_export(&mut self, script: bool, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
             self.notice = Some(("nothing to save".into(), Status::Warning));
             cx.notify();
             return;
         }
-        let list = disktree_core::export::delete_list(&plan.targets);
+        let list = if script {
+            self.delete_script(&plan.targets)
+        } else {
+            disktree_core::export::delete_list(&plan.targets)
+        };
         let count = plan.targets.len();
         let directory =
-            self.home.clone().unwrap_or_else(|| self.root_path.clone());
-        let chosen = cx
-            .prompt_for_new_path(&directory, Some("disktree-delete-list.txt"));
+            std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let filename = if script {
+            "disktree-delete.sh"
+        } else {
+            "disktree-delete-list.txt"
+        };
+        let chosen = cx.prompt_for_new_path(&directory, Some(filename));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
@@ -2470,6 +2620,35 @@ impl Disktree {
         .detach();
     }
 
+    fn delete_script(&self, targets: &[Target]) -> String {
+        let identity = if self.remote.is_some() {
+            self.remote_identity.clone()
+        } else {
+            disktree_core::identity::HostIdentity::current()
+        };
+        disktree_core::export::delete_script_for(
+            targets,
+            &self.root_path,
+            self.remote.as_deref(),
+            identity.as_ref(),
+        )
+    }
+
+    pub fn copy_delete_script(&mut self, cx: &mut Context<'_, Self>) {
+        let plan = self.plan();
+        if plan.is_empty() {
+            self.notice = Some(("nothing to copy".into(), Status::Warning));
+        } else {
+            let script = self.delete_script(&plan.targets);
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(script));
+            self.notice = Some((
+                "copied delete script; previews by default, checks host before deletion".into(),
+                Status::Success,
+            ));
+        }
+        cx.notify();
+    }
+
     /// Copy instructions for a coding agent to free the space by removing
     /// what the plan would act on, after checking each path.
     pub fn copy_agent_prompt(&mut self, cx: &mut Context<'_, Self>) {
@@ -2479,11 +2658,30 @@ impl Disktree {
             cx.notify();
             return;
         }
-        let prompt = disktree_core::export::agent_prompt(
-            &plan.targets,
-            &self.root_path,
-            self.space,
-        );
+        let mut prompt = if self.remote.is_some() {
+            disktree_core::export::agent_prompt_for(
+                &plan.targets,
+                &self.root_path,
+                self.space,
+                &self.remote_platform,
+                self.remote_identity.as_ref(),
+            )
+        } else {
+            disktree_core::export::agent_prompt(
+                &plan.targets,
+                &self.root_path,
+                self.space,
+            )
+        };
+        if let Some(host) = &self.remote {
+            prompt = format!(
+                "The scan is from remote SSH host {host} ({}), NOT this \
+                 computer. All paths below belong to that server. Connect \
+                 via SSH; verify the host and paths before acting. \
+                 Free space is a snapshot, not live.\n\n{prompt}",
+                self.remote_platform
+            );
+        }
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(prompt));
         let count = plan.targets.len();
         self.notice = Some((
@@ -2499,6 +2697,9 @@ impl Disktree {
 
     /// Show the tile a key acts on in Finder (or the file manager), selected.
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
+        if self.remote.is_some() {
+            return;
+        }
         let crumbs =
             self.action_target().unwrap_or_else(|| self.crumbs.clone());
         let Some(path) = self.path_at(&crumbs) else {
@@ -2679,7 +2880,9 @@ impl Disktree {
             "backspace" | "u" if !control => self.ascend(cx),
             // A filter is the first thing Escape takes away.
             "escape" if self.matches.is_some() => self.clear_filter(),
-            "escape" if self.scan.is_some() => self.cancel_scan(cx),
+            "escape" if self.scan.is_some() || self.remote_scan.is_some() => {
+                self.cancel_scan(cx);
+            }
             "escape" => {
                 if self.selected.is_some() {
                     self.selected = None;
@@ -2753,6 +2956,13 @@ impl Disktree {
     }
 
     fn on_review_key(&mut self, key: &str, cx: &mut Context<'_, Self>) {
+        if self.remote.is_some() && matches!(key, "m" | "p" | "enter") {
+            return;
+        }
+        if key == "e" {
+            self.save_delete_script(cx);
+            return;
+        }
         match key {
             "escape" => {
                 self.screen = Screen::Explore;
@@ -2770,6 +2980,7 @@ impl Disktree {
             }
             "s" => self.save_delete_list(cx),
             "a" => self.copy_agent_prompt(cx),
+            "y" => self.copy_delete_script(cx),
             "?" => {
                 self.show_help = true;
                 cx.notify();
@@ -3049,7 +3260,7 @@ impl Disktree {
     /// Declined, nothing changes. Not while a removal runs: quitting would
     /// stop a permanent delete halfway.
     pub fn restart_as_administrator(&mut self, cx: &mut Context<'_, Self>) {
-        if self.restarting || self.run.is_some() {
+        if self.remote.is_some() || self.restarting || self.run.is_some() {
             return;
         }
         self.restarting = true;
@@ -3192,7 +3403,10 @@ impl Render for Disktree {
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
         let title = format!(
-            "disktree · {}",
+            "disktree{} · {}",
+            self.remote.as_ref().map_or_else(String::new, |host| {
+                format!(" · {host} · read-only")
+            }),
             crate::marks::display_path(
                 &self.current_path(),
                 self.home.as_deref()

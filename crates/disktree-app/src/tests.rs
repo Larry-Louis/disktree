@@ -93,6 +93,66 @@ fn read<R>(
 }
 
 #[gpui_kit::test]
+fn remote_review_never_deletes_even_through_direct_actions(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.remote = Some("dev".into());
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.screen = Screen::Review;
+    });
+    draw(cx);
+    press(cx, "enter");
+    press(cx, "p");
+    press(cx, "m");
+    update(&view, cx, |app, cx| {
+        app.commit(cx);
+        app.confirm_delete(cx);
+        app.begin_removal(cx);
+        assert!(!app.confirm_open);
+        assert!(app.run.is_none());
+        assert_eq!(app.screen, Screen::Review);
+        let selection = app.plan();
+        assert_eq!(selection.targets.len(), 1);
+        assert!(selection.bytes() > 0);
+        assert_eq!(selection.reclaim(), 0);
+        assert_eq!(selection.foreign(), 0);
+        assert_eq!(selection.unattributed(), selection.bytes());
+        app.open_volumes(cx);
+        app.restart_as_administrator(cx);
+        assert!(!app.volumes_open);
+        assert!(!app.restarting);
+    });
+    draw(cx);
+    assert!(temp.path().join("junk/blob.bin").exists());
+    assert!(temp.path().join("keep/notes.txt").exists());
+}
+
+#[gpui_kit::test]
+fn a_failed_remote_scan_stops_showing_the_reading_screen(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.tree = None;
+        app.scan = None;
+        app.remote = Some("dev".into());
+        app.scan_error =
+            Some("SSH dev: Permission denied (publickey,password).".into());
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("scan-error").is_some());
+    assert!(cx.debug_bounds("scan-reading").is_none());
+}
+
+#[gpui_kit::test]
 fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
@@ -789,6 +849,50 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
         notice.is_some_and(|(message, _)| message.contains("copied")),
         "the copy is confirmed"
     );
+}
+
+#[gpui_kit::test]
+fn remote_review_copies_host_guarded_script_and_prompt(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.remote = Some("dev-alias".into());
+        app.remote_identity = Some(disktree_core::identity::HostIdentity {
+            hostname: "actual-server".into(),
+            machine_id: Some("abcdefabcdefabcdefabcdefabcdefab".into()),
+        });
+        app.marks.toggle(disktree_core::removal::Target {
+            path: temp.path().join("junk"),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    press(cx, "y");
+    let script = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("script on clipboard");
+    assert!(script.contains("actual-server"));
+    assert!(script.contains("/etc/machine-id"));
+    assert!(script.contains("Wrong hostname"));
+    assert!(script.contains("ssh -T"));
+    assert!(script.contains("PREVIEW ONLY"));
+    press(cx, "a");
+    let prompt = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("prompt on clipboard");
+    assert!(prompt.contains("actual-server"));
+    assert!(prompt.contains("abcdefabcdefabcdefabcdefabcdefab"));
+    assert!(prompt.contains("MANDATORY HOST CHECK"));
+    assert!(temp.path().join("junk/blob.bin").exists());
 }
 
 /// Escape in the alert dialog cancels: the dialog closes, the review screen

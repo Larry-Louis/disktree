@@ -66,7 +66,7 @@ pub fn root(
         .on_action(cx.listener(
             |this, _: &crate::app_menu::OpenFolder, _, cx| {
                 if this.can_start_over() {
-                    Disktree::open_folder(cx);
+                    this.open_folder(cx);
                 }
             },
         ))
@@ -409,6 +409,9 @@ fn explore(
 
 /// The selection, when it is a checkout git can say something about.
 fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
+    if app.remote.is_some() {
+        return None;
+    }
     let target = app.action_target()?;
     let node = app.node_at(&target)?;
     if !node.is_dir() {
@@ -1442,7 +1445,8 @@ fn selection_section(
         ))
         .child(widgets::bar(share, highlight, cx));
 
-    let fourth = if node.is_dir()
+    let fourth = if app.remote.is_none()
+        && node.is_dir()
         && let Some(path) = &path
         && crate::git::is_checkout(path)
     {
@@ -1939,7 +1943,11 @@ fn administrator_line(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Option<Div> {
-    if app.administrator != Some(false) || app.restarting || app.run.is_some() {
+    if app.remote.is_some()
+        || app.administrator != Some(false)
+        || app.restarting
+        || app.run.is_some()
+    {
         return None;
     }
     let errors = app.progress.errors;
@@ -2254,7 +2262,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 .child(format!("{:.1}\u{00d7}", app.view.scale)),
         );
     }
-    let scan = if app.scan.is_some() {
+    let scan = if app.scan.is_some() || app.remote_scan.is_some() {
         format!(
             "scanning \u{00b7} {} entries \u{00b7} {}",
             widgets::human_count(app.progress.files),
@@ -2286,13 +2294,46 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
 
 /// What the viewport shows while the first scan is running.
 fn scanning_panel(
-    app: &Disktree,
-    theme: &Theme,
-    cx: &Context<'_, Disktree>,
+    app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>,
 ) -> Div {
+    if let Some(error) = &app.scan_error {
+        return div()
+            .debug_selector(|| "scan-error".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap(space::LG)
+            .bg(theme.inset)
+            .child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::X)
+                    .size(icon::LG)
+                    .text_color(theme.danger),
+            )
+            .child(
+                div()
+                    .text_size(text::TITLE)
+                    .text_color(theme.bright)
+                    .child("Scan failed"),
+            )
+            .child(
+                div()
+                    .max_w(size::HELP)
+                    .p(space::MD)
+                    .border_1()
+                    .border_color(theme.danger)
+                    .text_color(theme.danger)
+                    .text_size(text::BODY)
+                    .child(error.clone()),
+            )
+            .child(widgets::hint("r", "retry scan", cx));
+    }
     let progress = &app.progress;
-    let cancelled = app.scan.is_none() && progress.cancelled;
-    let mut panel = div()
+    let cancelled = app.scan.is_none() && app.remote_scan.is_none() && progress.cancelled;
+    div()
+        .debug_selector(|| "scan-reading".into())
         .flex()
         .flex_col()
         .flex_1()
@@ -2366,7 +2407,7 @@ fn scanning_panel(
                 }),
         )
         // A failed scan has nothing left to cancel either.
-        .child(if app.scan.is_none() {
+        .child(if app.scan.is_none() && app.remote_scan.is_none() {
             button("scan-again", "Scan again", ButtonVariant::Outline, cx)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.start_scan(cx);
@@ -2378,21 +2419,7 @@ fn scanning_panel(
                     this.cancel_scan(cx);
                     window.focus(&this.focus, cx);
                 }))
-        });
-
-    if let Some(error) = &app.scan_error {
-        panel = panel.child(
-            div()
-                .max_w(size::HELP)
-                .p(space::MD)
-                .border_1()
-                .border_color(theme.danger)
-                .text_color(theme.danger)
-                .text_size(text::BODY)
-                .child(error.clone()),
-        );
-    }
-    panel
+        })
 }
 
 fn find_field(app: &Disktree, theme: &Theme) -> Div {
@@ -2739,13 +2766,20 @@ fn review_summary(
         cx,
     );
 
-    let explanation = match app.removal_mode {
-        RemovalMode::Trash => format!(
-            "Recoverable from the trash until it is emptied. Uses {}.",
-            app.trash_backend.label()
-        ),
-        RemovalMode::Permanent => {
-            "Deleted at once, like rm -rf. Nothing is recoverable.".to_string()
+    let explanation = if app.remote.is_some() {
+        "Read-only SSH session. Export the selection; nothing is \
+         deleted here. Free space is sampled at scan time."
+            .to_string()
+    } else {
+        match app.removal_mode {
+            RemovalMode::Trash => format!(
+                "Recoverable from the trash until it is emptied. Uses {}.",
+                app.trash_backend.label()
+            ),
+            RemovalMode::Permanent => {
+                "Deleted at once, like rm -rf. Nothing is recoverable."
+                    .to_string()
+            }
         }
     };
 
@@ -2765,7 +2799,7 @@ fn review_summary(
                 .flex_col()
                 .gap(space::SM)
                 .child(widgets::section("What happens", cx))
-                .child(mode)
+                .children(app.remote.is_none().then_some(mode))
                 .child(
                     div()
                         .text_size(text::CAPTION)
@@ -2846,7 +2880,7 @@ fn review_summary(
         .child(div().flex_1())
         .children(notice_line(app, theme, cx))
         .child(export_controls(plan, cx))
-        .child(commit_controls(app, plan, cx))
+        .children(app.remote.is_none().then(|| commit_controls(app, plan, cx)))
 }
 
 /// The list handed on instead of acted on: saved as paths, or copied as a
@@ -2857,7 +2891,7 @@ fn export_controls(
 ) -> Div {
     div()
         .flex()
-        .flex_row()
+        .flex_col()
         .justify_end()
         .gap(space::SM)
         .child(
@@ -2882,6 +2916,30 @@ fn export_controls(
             .disabled(plan.is_empty())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.copy_agent_prompt(cx);
+            })),
+        )
+        .child(
+            button(
+                "save-script",
+                "Save delete script…",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(plan.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.save_delete_script(cx);
+            })),
+        )
+        .child(
+            button(
+                "copy-script",
+                "Copy delete script",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(plan.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.copy_delete_script(cx);
             })),
         )
 }
@@ -2948,9 +3006,23 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .py(space::SM)
         .border_t_1()
         .border_color(theme.divider())
-        .child(widgets::hint("enter", commit, cx))
-        .child(widgets::hint("m", "trash", cx))
-        .child(widgets::hint("p", "permanent", cx))
+        .children(
+            app.remote
+                .is_none()
+                .then(|| widgets::hint("enter", commit, cx)),
+        )
+        .children(
+            app.remote
+                .is_none()
+                .then(|| widgets::hint("m", "trash", cx)),
+        )
+        .children(
+            app.remote
+                .is_none()
+                .then(|| widgets::hint("p", "permanent", cx)),
+        )
+        .child(widgets::hint("e", "save script", cx))
+        .child(widgets::hint("y", "copy script", cx))
         .child(widgets::hint("!", "unmark all", cx))
         .child(widgets::hint("s", "save list", cx))
         .child(widgets::hint("a", "copy as prompt", cx))
