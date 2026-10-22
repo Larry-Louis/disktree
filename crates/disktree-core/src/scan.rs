@@ -49,8 +49,8 @@ pub struct ScanOptions {
     /// `~/.cache` is frequently the largest directory in a home directory.
     pub include_hidden: bool,
     /// Stay on the root's volume: skip other disks, pseudo filesystems,
-    /// network shares and automount points, but keep subvolumes of the same
-    /// disk. See [`crate::space::foreign_mounts`]. On by default: a disk
+    /// network shares, bind mounts and subvolumes. Select those explicitly
+    /// as another root. See [`crate::space::mount_boundaries`]. A disk
     /// tool measures a disk, and its free-space meter only means anything
     /// for one volume.
     pub one_filesystem: bool,
@@ -375,6 +375,15 @@ impl WalkContext {
         {
             return Classified::Skipped;
         }
+        if self.options.one_filesystem
+            && let Some(foreign) = self.foreign_mounts.get()
+        {
+            // Checked by path before anything reads the directory, so an
+            // automount point is never triggered.
+            if foreign.contains(&path) {
+                return Classified::Skipped;
+            }
+        }
         // Read at most once per directory: macOS needs it for the dataless
         // flag, and the device check below wherever the mount table cannot
         // be read, which on macOS is everywhere.
@@ -397,15 +406,7 @@ impl WalkContext {
             tree.name = entry.take_name();
             return Classified::Entry(tree);
         }
-        if self.options.one_filesystem
-            && let Some(foreign) = self.foreign_mounts.get()
-        {
-            // Checked by path before anything reads the directory, so an
-            // automount point is never triggered.
-            if foreign.contains(&path) {
-                return Classified::Skipped;
-            }
-        } else if self.options.one_filesystem {
+        if self.options.one_filesystem && self.foreign_mounts.get().is_none() {
             match (directory(), self.root_device(&path)) {
                 (Ok(directory), Some(root_device))
                     if directory.device != root_device =>
@@ -872,7 +873,7 @@ fn scan_on_pool(
     let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
-        if let Some(foreign) = crate::space::foreign_mounts_for(canonical) {
+        if let Some(foreign) = crate::space::mount_boundaries_for(canonical) {
             let _ = context.foreign_mounts.set(foreign.into_iter().collect());
         }
     }
@@ -1211,7 +1212,7 @@ fn leaf_node(
 
 /// Last write time in Unix seconds, from the metadata the walk already has:
 /// age costs no extra system call.
-fn modified_seconds(meta: &Metadata) -> i64 {
+pub(crate) fn modified_seconds(meta: &Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1220,7 +1221,7 @@ fn modified_seconds(meta: &Metadata) -> i64 {
         })
 }
 
-fn measure(meta: &Metadata, apparent_size: bool) -> u64 {
+pub(crate) fn measure(meta: &Metadata, apparent_size: bool) -> u64 {
     if apparent_size {
         meta.len()
     } else {

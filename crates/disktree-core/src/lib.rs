@@ -18,6 +18,8 @@ mod macos;
 mod mft;
 pub mod payload;
 pub mod remote;
+#[cfg(unix)]
+mod remote_walk;
 pub mod removal;
 pub mod scan;
 pub mod scan_threads;

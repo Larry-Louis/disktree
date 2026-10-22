@@ -202,13 +202,23 @@ terminal, it can ask for a password or key passphrase there; GUI launches
 need key/agent access or a working SSH askpass helper. Connect once with
 `ssh dev` to verify access and accept its host key.
 
-The headless helper reuses the parallel scanner: allocated blocks, hardlink
-deduplication, hidden entries and mount boundaries have the same semantics as
-a local scan. One compressed SSH connection carries a versioned JSON request
-on stdin and compact postorder records on stdout. File contents never cross
-the connection, and paths are never interpolated into a remote shell command.
-The complete tree is retained for offline navigation; very large trees still
-require memory proportional to their entry count.
+The Linux/macOS helper streams a depth-first walk directly to stdout. It
+never constructs a tree or retains a directory's children: memory scales
+with open ancestors (at most 256), not file count. Only pending hardlink
+identities are retained, capped at 65,536; ordinary files need no identity
+storage. A resource limit fails explicitly instead of returning a partial
+tree. Symlinks are not followed and every nested mount is skipped, even a
+bind mount or same-device subvolume. Select those as separate roots.
+
+One compressed SSH connection carries a bounded JSON request on stdin and
+compact postorder records on stdout. The client keeps stdin open so the
+helper exits on disconnect, including while scanning or blocked on output.
+Linux helpers also enforce a 1 GiB address-space ceiling, disable core dumps,
+and stop after five minutes. File contents never cross the connection and
+paths are never interpolated into remote shell commands. Only the desktop
+retains the complete tree for offline navigation; its memory still scales
+with entry count. The native Windows helper currently retains the original
+tree-building scan path.
 
 Remote mode is **export-only**. Mark with Space, open review with `c`, then:
 
@@ -382,7 +392,8 @@ and removes duplicate hardlinks.
 Press `v` (or click **Volumes** beside the disk name in the side panel) to
 bring up the volume picker. It lists every candidate volume mounted on the
 system together with its free space, ordered fullest first, filtering out
-pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
+pseudo-filesystems and snapshots. Linux bind mounts and btrfs subvolumes
+remain separately selectable, even when they share a device. Selecting any
 entry resets the scan root directly to that volume.
 
 ## The whole disk
@@ -400,15 +411,15 @@ outside `~` (on this machine, seconds instead of a full rescan). The current
 view stays on screen until the wider tree lands, which then opens with the
 directory you came from selected. Going back down is just navigation.
 
-A scan stays on one volume, and a volume is the mount *source*, not the
-device number: btrfs gives each subvolume its own `st_dev`, so `/home`,
-`/var/log` and `/var/cache/pacman/pkg` are included, while `/proc`,
-`/sys`, `/run`, tmpfs, `/boot`, other disks, network shares and automount
-points are left out (checked by path, so an automounted NAS is never
-mounted just to be measured). Snapshot subvolumes are left out too: their
-files share blocks with the live ones, and counting them would count the disk
-twice. `-X` crosses into everything: a mark that lands on another volume is
-still removed, but it is not added to the metered volume's free space.
+By default a scan stops at **every nested mount point**, including bind
+mounts and same-device btrfs subvolumes. Boundaries are checked by path,
+before metadata or directory reads, so an automounted NAS is not activated
+just to measure its parent. Choose `/home`, `/var/log`, or another mount as
+its own root rather than implicitly traversing it from `/`.
+
+Local `-X` explicitly crosses mounts; remote streaming scans reject it.
+A local mark on another volume is still removed, but is not added to the
+metered volume's free-space projection.
 
 Without root, some system directories cannot be read; they are counted as
 unreadable in the top bar rather than guessed at.

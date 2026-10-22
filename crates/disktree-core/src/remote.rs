@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::scan::{ScanOptions, scan};
+use crate::scan::ScanOptions;
+#[cfg(not(unix))]
+use crate::scan::scan;
 use crate::space::{SpaceInfo, space_info, volume_root_for};
 use crate::tree::{Node, NodeKind, aggregate};
 
@@ -38,6 +40,16 @@ pub struct Request {
     pub options: ScanOptions,
 }
 
+// Old helpers ignore this extra field. Old clients may still half-close
+// stdin; only clients opting in promise to keep it open during the scan.
+#[derive(Serialize, Deserialize)]
+struct SessionRequest {
+    #[serde(flatten)]
+    request: Request,
+    #[serde(default)]
+    watch_disconnect: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Header {
     version: u32,
@@ -59,13 +71,24 @@ pub struct Snapshot {
 // Children are already on the receiver's stack; counts preserve empty dirs
 // and deduplicated leaves without transmitting derived subtree totals.
 #[derive(Debug, Serialize, Deserialize)]
-struct Record(String, u8, u64, u64, i64, bool, usize);
+pub(crate) struct Record(
+    pub String,
+    pub u8,
+    pub u64,
+    pub u64,
+    pub i64,
+    pub bool,
+    pub usize,
+);
 
 fn json_error(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-fn send(out: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+pub(crate) fn send(
+    out: &mut impl Write,
+    value: &impl Serialize,
+) -> io::Result<()> {
     serde_json::to_writer(&mut *out, value).map_err(json_error)?;
     out.write_all(b"\n")
 }
@@ -97,7 +120,18 @@ fn receive<T: serde::de::DeserializeOwned>(
 /// The helper has exactly one operation: scan. It never removes files,
 /// installs software, invokes sudo, or executes a command from the client.
 pub fn serve(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<()> {
-    let request: Request = receive(input)?;
+    let (request, _) = read_request(input)?;
+    serve_request(request, out)
+}
+
+/// Read one bounded request, including the opt-in connection lifetime.
+pub fn read_request(input: &mut impl BufRead) -> io::Result<(Request, bool)> {
+    let session: SessionRequest = receive(input)?;
+    Ok((session.request, session.watch_disconnect))
+}
+
+/// Scan a decoded request. The standalone helper supervises its lifetime.
+pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
     let home = std::env::home_dir();
     let root = request
         .root
@@ -112,26 +146,30 @@ pub fn serve(input: &mut impl BufRead, out: &mut impl Write) -> io::Result<()> {
     if !root.is_dir() {
         return Err(io::Error::other("scan root is not a directory"));
     }
-    let tree = scan(&root, request.options)?;
     send(
         out,
         &Header {
             version: VERSION,
             disk_root: volume_root_for(&root),
             space: space_info(&root).ok(),
-            root,
+            root: root.clone(),
             home,
             platform: std::env::consts::OS.into(),
             identity: crate::identity::HostIdentity::current(),
         },
     )?;
-    write_node(out, &tree)?;
+    out.flush()?;
+    #[cfg(unix)]
+    crate::remote_walk::stream(&root, &request.options, out)?;
+    #[cfg(not(unix))]
+    write_node(out, &scan(&root, request.options)?)?;
     // An explicit terminator distinguishes a complete scan from a severed SSH
     // connection after any otherwise valid prefix of the postorder stream.
     send(out, &"done")?;
     out.flush()
 }
 
+#[cfg(not(unix))]
 fn write_node(out: &mut impl Write, node: &Node) -> io::Result<()> {
     for child in &node.children {
         write_node(out, child)?;
@@ -280,8 +318,9 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
 }
 
 /// Cancelling a rescan or closing a window kills SSH and closes the pipe.
-/// SSH normally terminates its remote session too; the helper also exits
-/// when a write observes the closed connection.
+///
+/// The helper monitors stdin for EOF even before it has a tree to write;
+/// keep the request pipe open until the entire snapshot has arrived.
 #[derive(Debug)]
 pub struct RemoteScan {
     child: Arc<Mutex<Child>>,
@@ -354,8 +393,13 @@ impl RemoteScan {
                         &archive, &mut input, &mut stdin,
                     )?;
                 }
-                send(&mut stdin, &request)?;
-                drop(stdin);
+                send(
+                    &mut stdin,
+                    &SessionRequest {
+                        request,
+                        watch_disconnect: true,
+                    },
+                )?;
                 read_snapshot(&mut input)
             })()
             .map(|mut snapshot| {
@@ -364,6 +408,7 @@ impl RemoteScan {
                 }
                 snapshot
             });
+            drop(stdin);
             let mut process = worker.lock().expect("SSH process lock");
             if snapshot.is_err() {
                 let _ = process.kill();
@@ -443,7 +488,7 @@ mod tests {
     #[test]
     fn ssh_authentication_diagnostics_reach_the_caller() {
         let error = failing_process(
-            "cat >/dev/null; echo 'Permission denied (publickey,password).' \
+            "read -r request; echo 'Permission denied (publickey,password).' \
              >&2; exit 255",
         )
         .to_string();
@@ -457,7 +502,7 @@ mod tests {
     #[test]
     fn missing_helper_diagnostics_name_the_server() {
         let error = failing_process(
-            "cat >/dev/null; echo 'disktree-scan: command not found' \
+            "read -r request; echo 'disktree-scan: command not found' \
              >&2; exit 127",
         )
         .to_string();
@@ -470,7 +515,7 @@ mod tests {
     fn banner_and_truncated_output_are_reported_without_a_hang() {
         for output in ["hello", "hello\\n"] {
             let error =
-                failing_process(&format!("cat >/dev/null; printf '{output}'"))
+                failing_process(&format!("read -r request; printf '{output}'"))
                     .to_string();
             assert!(error.contains("SSH dev:"), "{error}");
         }
