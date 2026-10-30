@@ -857,7 +857,7 @@ impl Disktree {
                         0,
                         disktree_core::space::Volume {
                             point: home,
-                            device: Some("Home directory".into()),
+                            device: Some(t!(cx, "Home directory").into()),
                             space: None,
                         },
                     );
