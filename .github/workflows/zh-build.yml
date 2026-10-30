@@ -1,0 +1,41 @@
+﻿name: zh-build
+
+# Temporary: build a Windows binary from the Simplified Chinese branch so it
+# can be tried without a local Rust toolchain. Not meant for upstream.
+
+on:
+  push:
+    branches: [zh-cn]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build Windows x86_64
+    runs-on: windows-2025
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked -p disktree-app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disktree-zh-cn-windows-x86_64
+          path: target/release/disktree.exe
+          if-no-files-found: error
